@@ -56,6 +56,10 @@ REFERENCES_ROOT = Path(__file__).resolve().parent / "references"
 RELISTEN_BASE = "https://api.relisten.net/api/v3"
 ARTIST_SLUG = "grateful-dead"
 
+# Relisten (and Archive's CDN) reject default Python requests UAs with 403.
+USER_AGENT = "countme.in/1.0 (https://github.com/TheKeeks/countme.in)"
+HTTP_HEADERS = {"User-Agent": USER_AGENT}
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -73,6 +77,9 @@ class Candidate:
     extra: dict = field(default_factory=dict)
     score: float = 0.0
     score_reasons: list[str] = field(default_factory=list)
+    # True when at least one query-derived signal (date / year / venue /
+    # keyword / era) matched. Quality bias alone does not count.
+    query_matched: bool = False
 
     @property
     def show_year(self) -> Optional[int]:
@@ -217,6 +224,28 @@ def parse_year_only(query: str) -> Optional[int]:
     return None
 
 
+def query_target_year(query: Optional[str]) -> Optional[int]:
+    """Best guess at what year the query is asking for, for ±1 window filtering."""
+    if not query:
+        return None
+    # Hand-curated keyword shortcuts win first -- otherwise something like
+    # "Dick's Picks 25" gets day-parsed by dateutil into the current year.
+    q = query.lower()
+    for kw, (kdate, _venue) in KEYWORD_DATES.items():
+        if kw in q:
+            try:
+                return int(kdate[:4])
+            except ValueError:
+                pass
+    dates = parse_date_tokens(query)
+    if dates:
+        return dates[0].year
+    return parse_year_only(query)
+
+
+YEAR_WINDOW_PENALTY = -100
+
+
 def score_candidate(cand: Candidate, query: Optional[str]) -> float:
     """Fuzzy score: higher = better match for the query.
 
@@ -227,18 +256,26 @@ def score_candidate(cand: Candidate, query: Optional[str]) -> float:
         - Keyword hits ("Cornell", "Dick's Picks"): +30
         - Era keyword: +5
         - Quality bias: SBD > MATRIX > AUD (+5/+3/+0)
+        - Year-window penalty: -100 when query implies a year and the
+          candidate is more than 1 year away. Keeps 1960s shows from
+          floating to the top of a 1977 query just because they're SBDs.
     """
     cand.score = 0.0
     cand.score_reasons = []
+    cand.query_matched = False
+
+    def mark(bonus: float, reason: str, *, query_signal: bool = True) -> None:
+        cand.score += bonus
+        cand.score_reasons.append(reason)
+        if query_signal:
+            cand.query_matched = True
 
     # Always-on quality bias so default sorts make sense even without a query.
     q_str = (cand.quality or "").upper()
     if "SBD" in q_str or "SOUNDBOARD" in q_str:
-        cand.score += 5
-        cand.score_reasons.append("+5 SBD")
+        mark(5, "+5 SBD", query_signal=False)
     elif "MATRIX" in q_str:
-        cand.score += 3
-        cand.score_reasons.append("+3 matrix")
+        mark(3, "+3 matrix", query_signal=False)
     elif "AUD" in q_str:
         cand.score_reasons.append("+0 AUD")
 
@@ -251,26 +288,22 @@ def score_candidate(cand: Candidate, query: Optional[str]) -> float:
     for kw, (kdate, kvenue) in KEYWORD_DATES.items():
         if kw in q:
             if cand.show_date == kdate:
-                cand.score += 30
-                cand.score_reasons.append(f"+30 keyword '{kw}' -> date match")
+                mark(30, f"+30 keyword '{kw}' -> date match")
             elif cand.venue and kvenue.lower() in cand.venue.lower():
-                cand.score += 20
-                cand.score_reasons.append(f"+20 keyword '{kw}' -> venue match")
+                mark(20, f"+20 keyword '{kw}' -> venue match")
 
     # Date match
     dates = parse_date_tokens(query)
     if dates and cand.show_date:
         for d in dates:
             if cand.show_date == d.isoformat():
-                cand.score += 50
-                cand.score_reasons.append(f"+50 exact date {d.isoformat()}")
+                mark(50, f"+50 exact date {d.isoformat()}")
                 break
 
     # Year-only match
     yr = parse_year_only(query)
     if yr and cand.show_year == yr:
-        cand.score += 10
-        cand.score_reasons.append(f"+10 year {yr}")
+        mark(10, f"+10 year {yr}")
 
     # Venue substring / token overlap
     if cand.venue:
@@ -284,14 +317,21 @@ def score_candidate(cand: Candidate, query: Optional[str]) -> float:
         venue_hits = [t for t in tokens if t in venue_l]
         if venue_hits:
             bonus = min(20, 8 * len(venue_hits))
-            cand.score += bonus
-            cand.score_reasons.append(f"+{bonus} venue tokens {venue_hits}")
+            mark(bonus, f"+{bonus} venue tokens {venue_hits}")
 
     # Era keyword
     for kw, (lo, hi) in ERA_KEYWORDS.items():
         if kw in q and cand.show_year and lo <= cand.show_year <= hi:
-            cand.score += 5
-            cand.score_reasons.append(f"+5 era '{kw}'")
+            mark(5, f"+5 era '{kw}'")
+
+    # Year-window penalty: out-of-window shows must not outrank the
+    # in-window ones just from a +5 SBD bonus.
+    target_year = query_target_year(query)
+    if target_year and cand.show_year and abs(cand.show_year - target_year) > 1:
+        cand.score += YEAR_WINDOW_PENALTY
+        cand.score_reasons.append(
+            f"{YEAR_WINDOW_PENALTY} year {cand.show_year} outside {target_year}±1"
+        )
 
     return cand.score
 
@@ -305,7 +345,7 @@ def _http_get_json(url: str, timeout: int = 30) -> Optional[object]:
         log.error("requests is not installed")
         return None
     try:
-        resp = requests.get(url, timeout=timeout)
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=timeout)
         if resp.status_code != 200:
             log.debug("GET %s -> %s", url, resp.status_code)
             return None
@@ -411,6 +451,15 @@ def relisten_resolve_track_url(cand: Candidate, song: str) -> Optional[str]:
 # Internet Archive source
 # ---------------------------------------------------------------------------
 
+def _archive_song_phrase(song: str) -> str:
+    """Phrase form of a song name for Archive's full-text search.
+
+    Hyphens become spaces; the rest is left alone. Used inside quoted
+    field queries, so internal punctuation other than hyphens is fine.
+    """
+    return re.sub(r"[-_]+", " ", song).strip()
+
+
 def archive_candidates(song: str, era: Optional[tuple[int, int]]) -> list[Candidate]:
     try:
         import internetarchive as ia
@@ -418,10 +467,18 @@ def archive_candidates(song: str, era: Optional[tuple[int, int]]) -> list[Candid
         log.warning("internetarchive not installed; skipping Archive source")
         return []
 
-    query_parts = ['collection:GratefulDead', 'mediatype:etree']
+    # Pre-filter to shows that actually mention the song. Without this we'd
+    # pull the entire GratefulDead collection (~10k items) and try them
+    # one-by-one before noticing the song isn't on the setlist.
+    phrase = _archive_song_phrase(song)
+    song_clause = (
+        f'(subject:"{phrase}" OR description:"{phrase}" OR title:"{phrase}")'
+    )
+    query_parts = ['collection:GratefulDead', 'mediatype:etree', song_clause]
     if era:
         query_parts.append(f"year:[{era[0]} TO {era[1]}]")
     query = " AND ".join(query_parts)
+    log.debug("Archive query: %s", query)
 
     candidates: list[Candidate] = []
     try:
@@ -585,7 +642,7 @@ def http_download(url: str, dest: Path) -> bool:
     if requests is None:
         return False
     try:
-        with requests.get(url, stream=True, timeout=60) as resp:
+        with requests.get(url, headers=HTTP_HEADERS, stream=True, timeout=60) as resp:
             if resp.status_code != 200:
                 log.warning("HTTP %s for %s", resp.status_code, url)
                 return False
@@ -740,6 +797,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--source", choices=["auto", "relisten", "archive", "youtube"], default="auto")
     p.add_argument("-v", "--verbose", action="store_true", help="Show each candidate and score")
     p.add_argument("--out", help="Override output directory (defaults to tooling/references/<song_slug>/)")
+    p.add_argument(
+        "--max-attempts-per-source",
+        type=int,
+        default=25,
+        help="Give up on a source after this many consecutive download failures (default 25)",
+    )
     return p.parse_args(argv)
 
 
@@ -766,15 +829,39 @@ def main(argv: Optional[list[str]] = None) -> int:
     manifest_entries: list[dict] = []
 
     sources_to_try = SOURCE_ORDER if args.source == "auto" else (args.source,)
+    any_query_matches_seen = False
     for s in sources_to_try:
         if len(downloaded) >= args.count:
             break
         cands = rank(source_buckets.get(s, []), args.query)
         if args.verbose:
             log.info("[%s] %d candidates", s, len(cands))
+
+        # Fail-fast: if a query was given but nothing in this source matched
+        # any of its signals, don't bother trying to download. Move on to
+        # the next source (the global no-matches error fires at the end if
+        # no source produces a match).
+        if args.query and cands and not any(c.query_matched for c in cands):
+            log.warning(
+                "[%s] no good matches for query %r (top score=%.1f); skipping source",
+                s, args.query, cands[0].score,
+            )
+            continue
+        if args.query:
+            any_query_matches_seen = True
+
+        attempts = 0
+        failures = 0
         for cand in cands:
             if len(downloaded) >= args.count:
                 break
+            if failures >= args.max_attempts_per_source:
+                log.warning(
+                    "[%s] giving up after %d consecutive failures (--max-attempts-per-source)",
+                    s, failures,
+                )
+                break
+            attempts += 1
             fname = candidate_filename(song_slug, cand)
             if fname in seen_files:
                 log_candidate(cand, args.verbose, kept=False, note="(dup filename)")
@@ -782,9 +869,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             local_path = download_candidate(cand, args.song, out_dir)
             if local_path is None:
+                failures += 1
                 log_candidate(cand, args.verbose, kept=False, note="(download failed)")
                 continue
 
+            failures = 0  # reset on success; cap is on *consecutive* failures
             seen_files.add(fname)
             downloaded.append((cand, local_path))
             log_candidate(cand, args.verbose, kept=True)
@@ -809,6 +898,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"  - [{cand.source}] {cand.show_date or '????'} "
               f"{cand.venue or '?'} ({cand.quality or '?'}) -> {path.name}")
     if not downloaded:
+        if args.query and not any_query_matches_seen:
+            print(f"  no good matches for query {args.query!r} in any source")
+            return 2
         print("  (nothing downloaded)")
         return 1
     return 0

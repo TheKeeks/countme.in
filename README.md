@@ -86,14 +86,33 @@ the HuggingFace model weights need.
 3. Pick **Add a song** from the workflow list on the left.
 4. Click **Run workflow** in the top-right. Fill in:
    - `song` (required) — slug or name, e.g. `peggy-o`
-   - `query` (optional) — natural-language match, e.g. `5/5/77 New Haven`
+   - `when` (optional) — when/where you want it from (see examples below)
    - `count` (optional) — how many references to fetch (default `2`)
-   - `era` (optional) — year range like `1977-1981`
    - `source` (optional) — `auto` (default), `relisten`, `archive`, or `youtube`
    - `band_recording_url` (optional) — direct URL (e.g. Dropbox share) to a
      band reference recording; it joins the downloaded references for blending
    - `commit_template` (optional) — when true (default), the finished template
      is committed to `web/templates/` and auto-deploys to the live site
+
+   The `when` field accepts a wide range of formats:
+
+   | Example | Picks |
+   | --- | --- |
+   | `1977` | any show from 1977 (±1 year tolerance) |
+   | `1977-1981` | any show in the inclusive year range — useful for nailing a particular era arrangement |
+   | `May 1977` or `1977-05` | any show in May 1977 |
+   | `5/8/77` or `May 8 1977` or `1977-05-08` | the specific date |
+   | `Cornell` | 5/8/77 Barton Hall |
+   | `New Haven` | venue match — likely 5/5/77 |
+   | `Dick's Picks 25` | 5/10/78 Veterans Memorial Coliseum |
+   | `Europe 72` / `Wall of Sound` / `Brent era` | era keywords |
+   | `5/5/77 New Haven` | free-form combinations also work |
+
+   For songs whose arrangement varies across eras, leaning on the year range
+   is the easiest way to get a stylistically consistent template — e.g. for
+   Peggy O, `when: 1977-1981` pulls the Cornell-era version rather than the
+   later, slower arrangement.
+
 5. Hit the green **Run workflow** button. Expect ~3–5 minutes (downloads,
    Whisper, MERT embeddings).
 6. Two artifacts come out: `references-<song>` (the source MP3s) and

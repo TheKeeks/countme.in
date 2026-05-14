@@ -18,11 +18,17 @@ Usage
         --song peggy-o --count 2 [--era 1977-1981] \\
         [--query "New Haven 1977"] [--source auto|relisten|archive|youtube]
 
-The --query flag is the primary natural-language entry point. Examples:
-    "New Haven 1977"  -> 5/5/77 New Haven Coliseum
-    "5/8/77"          -> Cornell, Barton Hall
-    "May 10 1978"     -> Veterans Memorial Coliseum
-    "Cornell"         -> 5/8/77 Barton Hall
+The --query flag is the primary natural-language entry point. It accepts
+any of:
+
+    Year:         "1977"
+    Year range:   "1977-1981"
+    Month+year:   "May 1977"  /  "1977-05"
+    Specific:     "5/8/77"  /  "May 8 1977"  /  "1977-05-08"
+    Venue/city:   "Cornell"  /  "New Haven"  /  "Barton Hall"
+    Famous show:  "Dick's Picks 25"  /  "Europe 72"
+    Era keyword:  "Wall of Sound"  /  "Brent era"
+    Free-text:    "5/5/77 New Haven"  /  "1977 soundboard"
 """
 
 from __future__ import annotations
@@ -215,9 +221,49 @@ def parse_date_tokens(query: str) -> list[date]:
     return found
 
 
-def parse_year_only(query: str) -> Optional[int]:
-    """A bare 4-digit year like '1977' (not part of a date)."""
+def parse_year_range(query: Optional[str]) -> Optional[tuple[int, int]]:
+    """Detect `YYYY-YYYY` (e.g. `1977-1981`). Returns (lo, hi) or None."""
     if not query:
+        return None
+    m = re.search(r"\b(19[6-9]\d|20\d{2})\s*-\s*(19[6-9]\d|20\d{2})\b", query)
+    if not m:
+        return None
+    a, b = int(m.group(1)), int(m.group(2))
+    return (min(a, b), max(a, b))
+
+
+def parse_month_year(query: Optional[str]) -> Optional[tuple[int, int]]:
+    """Detect bare month/year refs like `May 1977` or `1977-05` (no day).
+
+    Returns (month, year). Skips full dates (`May 8 1977`, `1977-05-08`)
+    which the date parser handles.
+    """
+    if not query:
+        return None
+    q = query.lower()
+
+    # "May 1977" / "May, 1977" -- but NOT "May 8 1977" (a full date).
+    for m in re.finditer(
+        r"\b(" + "|".join(MONTHS.keys()) + r")[,\s]+(19[6-9]\d|20\d{2})\b", q
+    ):
+        return (MONTHS[m.group(1)], int(m.group(2)))
+
+    # "1977-05" -- but NOT "1977-05-08" or "1977-1981".
+    for m in re.finditer(
+        r"\b(19[6-9]\d|20\d{2})-(\d{1,2})\b(?!-\d)(?!\s*-\s*\d{4})", q
+    ):
+        month = int(m.group(2))
+        if 1 <= month <= 12:
+            return (month, int(m.group(1)))
+    return None
+
+
+def parse_year_only(query: str) -> Optional[int]:
+    """A bare 4-digit year like '1977' (not part of a YYYY-YYYY range)."""
+    if not query:
+        return None
+    # A year-range query (1977-1981) is not a single-year query.
+    if parse_year_range(query) is not None:
         return None
     for m in re.finditer(r"\b(19[6-9]\d|20\d{2})\b", query):
         return int(m.group(1))
@@ -225,8 +271,14 @@ def parse_year_only(query: str) -> Optional[int]:
 
 
 def query_target_year(query: Optional[str]) -> Optional[int]:
-    """Best guess at what year the query is asking for, for ±1 window filtering."""
+    """Best guess at the target year for ±1 window filtering.
+
+    Returns None when the query specifies a year range -- in that case the
+    range itself supersedes the single-year window penalty.
+    """
     if not query:
+        return None
+    if parse_year_range(query) is not None:
         return None
     # Hand-curated keyword shortcuts win first -- otherwise something like
     # "Dick's Picks 25" gets day-parsed by dateutil into the current year.
@@ -240,10 +292,14 @@ def query_target_year(query: Optional[str]) -> Optional[int]:
     dates = parse_date_tokens(query)
     if dates:
         return dates[0].year
+    my = parse_month_year(query)
+    if my:
+        return my[1]
     return parse_year_only(query)
 
 
 YEAR_WINDOW_PENALTY = -100
+YEAR_RANGE_OUTSIDE_PENALTY = -50
 
 
 def score_candidate(cand: Candidate, query: Optional[str]) -> float:
@@ -251,14 +307,19 @@ def score_candidate(cand: Candidate, query: Optional[str]) -> float:
 
     Components:
         - Exact date match: +50
-        - Year match: +10
-        - Venue substring match: +20 (with partial credit for token overlap)
         - Keyword hits ("Cornell", "Dick's Picks"): +30
+        - Month+year match: +25 (same month and year)
+        - Venue substring match: up to +20 (token-overlap based)
+        - Single-year match: +10
+        - Month/year partial: +10 same year diff month, +5 same month diff year
+        - Year-in-range (YYYY-YYYY): +5
         - Era keyword: +5
         - Quality bias: SBD > MATRIX > AUD (+5/+3/+0)
-        - Year-window penalty: -100 when query implies a year and the
-          candidate is more than 1 year away. Keeps 1960s shows from
-          floating to the top of a 1977 query just because they're SBDs.
+        - Year-window penalty: -100 when query implies a single year and the
+          candidate is more than 1 year away. Skipped when a year range is
+          provided -- the range handles its own filtering.
+        - Year-out-of-range penalty: -50 for candidates outside an explicit
+          `YYYY-YYYY` range in the query.
     """
     cand.score = 0.0
     cand.score_reasons = []
@@ -284,6 +345,36 @@ def score_candidate(cand: Candidate, query: Optional[str]) -> float:
 
     q = query.lower()
 
+    year_range = parse_year_range(query)
+    month_year = parse_month_year(query)
+
+    # Year range (e.g. "1977-1981"): reward in-range, heavily penalize out.
+    if year_range and cand.show_year is not None:
+        lo, hi = year_range
+        if lo <= cand.show_year <= hi:
+            mark(5, f"+5 year {cand.show_year} in range {lo}-{hi}")
+        else:
+            cand.score += YEAR_RANGE_OUTSIDE_PENALTY
+            cand.score_reasons.append(
+                f"{YEAR_RANGE_OUTSIDE_PENALTY} year {cand.show_year} outside {lo}-{hi}"
+            )
+
+    # Month/year (e.g. "May 1977" or "1977-05"): graded match.
+    if month_year and cand.show_date and cand.show_year is not None:
+        target_month, target_year = month_year
+        cand_month: Optional[int] = None
+        try:
+            cand_month = int(cand.show_date[5:7])
+        except (ValueError, IndexError):
+            cand_month = None
+        if cand_month is not None:
+            if cand_month == target_month and cand.show_year == target_year:
+                mark(25, f"+25 month/year {target_year}-{target_month:02d}")
+            elif cand.show_year == target_year:
+                mark(10, f"+10 same year {target_year}")
+            elif cand_month == target_month:
+                mark(5, f"+5 same month {target_month:02d}")
+
     # Keyword shortcuts (Cornell, Dick's Picks N, ...)
     for kw, (kdate, kvenue) in KEYWORD_DATES.items():
         if kw in q:
@@ -300,10 +391,11 @@ def score_candidate(cand: Candidate, query: Optional[str]) -> float:
                 mark(50, f"+50 exact date {d.isoformat()}")
                 break
 
-    # Year-only match
-    yr = parse_year_only(query)
-    if yr and cand.show_year == yr:
-        mark(10, f"+10 year {yr}")
+    # Year-only match (skipped if a month/year already scored the year axis).
+    if not month_year:
+        yr = parse_year_only(query)
+        if yr and cand.show_year == yr:
+            mark(10, f"+10 year {yr}")
 
     # Venue substring / token overlap
     if cand.venue:
@@ -325,7 +417,8 @@ def score_candidate(cand: Candidate, query: Optional[str]) -> float:
             mark(5, f"+5 era '{kw}'")
 
     # Year-window penalty: out-of-window shows must not outrank the
-    # in-window ones just from a +5 SBD bonus.
+    # in-window ones just from a +5 SBD bonus. Skipped when the query has
+    # a year range -- the range's own penalty applies instead.
     target_year = query_target_year(query)
     if target_year and cand.show_year and abs(cand.show_year - target_year) > 1:
         cand.score += YEAR_WINDOW_PENALTY
@@ -793,7 +886,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--song", required=True, help="Song slug or name, e.g. 'peggy-o'")
     p.add_argument("--count", type=int, default=2, help="How many references to fetch (default 2)")
     p.add_argument("--era", type=parse_era, help="Year range filter, e.g. 1977-1981")
-    p.add_argument("--query", help='Free-form match text, e.g. "New Haven 1977" or "5/8/77"')
+    p.add_argument(
+        "--query",
+        help=(
+            "Free-form match text for the show you want. Supports: "
+            "year ('1977'), year range ('1977-1981'), month+year ('May 1977' "
+            "or '1977-05'), specific date ('5/8/77', 'May 8 1977', "
+            "'1977-05-08'), venue or city ('Cornell', 'New Haven', "
+            "'Barton Hall'), famous-show shortcuts (\"Dick's Picks 25\", "
+            "'Europe 72'), era keywords ('Wall of Sound', 'Brent era'), or "
+            "free-form combinations ('5/5/77 New Haven', '1977 soundboard')."
+        ),
+    )
     p.add_argument("--source", choices=["auto", "relisten", "archive", "youtube"], default="auto")
     p.add_argument("-v", "--verbose", action="store_true", help="Show each candidate and score")
     p.add_argument("--out", help="Override output directory (defaults to tooling/references/<song_slug>/)")

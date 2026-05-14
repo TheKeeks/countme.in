@@ -7,8 +7,8 @@ on:
         description: 'Song slug or name (e.g. peggy-o)'
         required: true
         type: string
-      query:
-        description: 'Optional natural-language query (e.g. "5/5/77 New Haven")'
+      when:
+        description: "When/where (e.g. '1977', '1977-1981', 'May 1977', '5/8/77', 'Cornell', \"Dick's Picks 25\")"
         required: false
         type: string
       count:
@@ -16,10 +16,6 @@ on:
         required: false
         type: string
         default: '2'
-      era:
-        description: 'Year range, e.g. 1977-1981'
-        required: false
-        type: string
       source:
         description: 'Which source to pull from'
         required: false
@@ -79,18 +75,14 @@ jobs:
         id: fetch
         env:
           SONG: ${{ inputs.song }}
-          QUERY: ${{ inputs.query }}
+          WHEN: ${{ inputs.when }}
           COUNT: ${{ inputs.count }}
-          ERA: ${{ inputs.era }}
           SOURCE: ${{ inputs.source }}
         run: |
           set -euo pipefail
           args=(--song "$SONG" --count "$COUNT" --source "$SOURCE" -v)
-          if [[ -n "${QUERY:-}" ]]; then
-            args+=(--query "$QUERY")
-          fi
-          if [[ -n "${ERA:-}" ]]; then
-            args+=(--era "$ERA")
+          if [[ -n "${WHEN:-}" ]]; then
+            args+=(--query "$WHEN")
           fi
           python tooling/fetch_references.py "${args[@]}"
 

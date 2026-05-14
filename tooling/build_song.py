@@ -205,6 +205,7 @@ def process_reference(audio_path: Path, template: dict, extractor: EmbeddingExtr
         "spans": {(section_id, line_idx): {start_sec, end_sec, ...}, ...},
         "line_embeddings": {(section_id, line_idx): np.ndarray | None},
         "section_sequences": {section_id: [np.ndarray, ...]},
+        "section_bounds": {section_id: (start_sec, end_sec)},
     }
     """
     log.info("[%s] aligning ...", audio_path.name)
@@ -285,6 +286,12 @@ def process_reference(audio_path: Path, template: dict, extractor: EmbeddingExtr
         "spans": spans,
         "line_embeddings": line_embeddings,
         "section_sequences": section_sequences,
+        # Per-section (start_sec, end_sec) covering both lyric-derived bounds
+        # (vocal sections) and neighbour-derived bounds (intro / jam / outro).
+        # Used by _populate_sections to stamp explicit start_time / end_time
+        # fields on every section -- including the instrumental ones the
+        # time-prior validator needs.
+        "section_bounds": dict(bounds),
     }
 
 
@@ -460,12 +467,12 @@ def _populate_lines(template: dict, per_ref: list[dict]) -> None:
 
 def _populate_sections(template: dict, per_ref: list[dict]) -> None:
     for section in template["structure"]:
-        sequences = [r["section_sequences"].get(section["section_id"], [])
-                     for r in per_ref]
+        sid = section["section_id"]
+        sequences = [r["section_sequences"].get(sid, []) for r in per_ref]
         blended_seq = blend_sequences(sequences)
         section["audio_embedding_sequence"] = _round_seq(blended_seq)
 
-        # Roll section bounds from blended line bounds.
+        # Roll section bounds from blended line bounds (legacy field).
         starts = [l["start_sec"] for l in section["lines"]
                   if l.get("start_sec") is not None]
         ends = [l["end_sec"] for l in section["lines"]
@@ -474,6 +481,27 @@ def _populate_sections(template: dict, per_ref: list[dict]) -> None:
             section["start_sec"] = round(max(0.0, min(starts) - 0.5), 3)
         if ends:
             section["end_sec"] = round(max(ends) + 0.5, 3)
+
+        # Explicit start_time / end_time on every section -- this is what the
+        # time-prior validator reads. Vocal sections use first-line-start /
+        # last-line-end. Instrumental sections (no lyric lines) fall back to
+        # the per-reference (start_sec, end_sec) covering the audio chunks
+        # we extracted embeddings from, blended across references via median.
+        if section["lines"]:
+            line_starts = [l["start_sec"] for l in section["lines"]
+                           if l.get("start_sec") is not None]
+            line_ends = [l["end_sec"] for l in section["lines"]
+                         if l.get("end_sec") is not None]
+            if line_starts and line_ends:
+                section["start_time"] = round(float(min(line_starts)), 3)
+                section["end_time"] = round(float(max(line_ends)), 3)
+                continue
+        per_ref_bounds = [r.get("section_bounds", {}).get(sid) for r in per_ref]
+        per_ref_starts = [b[0] for b in per_ref_bounds if b is not None]
+        per_ref_ends = [b[1] for b in per_ref_bounds if b is not None]
+        if per_ref_starts and per_ref_ends:
+            section["start_time"] = round(float(np.median(per_ref_starts)), 3)
+            section["end_time"] = round(float(np.median(per_ref_ends)), 3)
 
 
 # ---------------------------------------------------------------------------

@@ -80,28 +80,86 @@ The easiest path is the **Add a song** GitHub Actions workflow. It runs on
 GitHub's cloud, so it has the outbound internet access the downloader and
 the HuggingFace model weights need.
 
-1. Add a `tooling/songs/<song_slug>.lyrics` file describing the song's section
-   structure and lyric lines (see `docs/HOW-TO-ADD-A-SONG.md`).
-2. Go to the repo's **Actions** tab on GitHub.
-3. Pick **Add a song** from the workflow list on the left.
-4. Click **Run workflow** in the top-right. Fill in:
+There are two ways to point it at reference recordings, depending on what
+you want from the template:
+
+### Option A — Pin to a specific show (recommended for cover bands)
+
+When you're learning a particular version and want your live cue tracking
+to match _that_ performance, use the `show` input. The workflow finds the
+canonical show and pulls multiple **different mixes** of it (SBD, MATRIX,
+AUD) so the template's per-line fingerprints are robust to mic placement
+and remaster differences but still locked to one arrangement.
+
+Example: a cover band working up Cornell '77 Peggy-O would dispatch with
+
+```
+song:    peggy-o
+show:    5/8/77 Cornell
+count:   3
+sources: SBD,MATRIX
+```
+
+and get back e.g. an SBD, a MATRIX, and a second SBD of 5/8/77 if MATRIX
+isn't available.
+
+### Option B — Match an era / style
+
+When no single canonical version is preferred and you want the template to
+capture a stylistic neighbourhood (Brent-era space jams, primal-era barn
+burners, 1977 spring tour), leave `show` empty and fill in `era`. The
+workflow pulls `count` _different_ shows that match — one per (year, month)
+where possible so the references actually spread across the era.
+
+```
+song:    peggy-o
+era:     1977-1981
+count:   3
+sources: SBD,MATRIX
+```
+
+### Workflow inputs
+
+1. Add a `tooling/songs/<song_slug>.lyrics` file describing the song's
+   section structure and lyric lines (see `docs/HOW-TO-ADD-A-SONG.md`).
+2. Open the repo's **Actions** tab, pick **Add a song**, click **Run workflow**.
+3. Fill in:
    - `song` (required) — slug or name, e.g. `peggy-o`
-   - `query` (optional) — natural-language match, e.g. `5/5/77 New Haven`
-   - `count` (optional) — how many references to fetch (default `2`)
-   - `era` (optional) — year range like `1977-1981`
-   - `source` (optional) — `auto` (default), `relisten`, `archive`, or `youtube`
-   - `band_recording_url` (optional) — direct URL (e.g. Dropbox share) to a
-     band reference recording; it joins the downloaded references for blending
-   - `commit_template` (optional) — when true (default), the finished template
-     is committed to `web/templates/` and auto-deploys to the live site
-5. Hit the green **Run workflow** button. Expect ~3–5 minutes (downloads,
-   Whisper, MERT embeddings).
-6. Two artifacts come out: `references-<song>` (the source MP3s) and
-   `template-<song>` (the final JSON). If `commit_template` was on, the
-   template is also in `web/templates/` on the triggering branch.
+   - `show` (optional) — pin to one performance; mixes get diversified
+   - `era` (optional) — fall back to era-style spread; one show per month
+   - `sources` (optional) — comma-separated allowlist (default `SBD,MATRIX`;
+     pass `SBD,AUD,MATRIX` to widen, `ANY` to accept unlabelled too)
+   - `count` (optional) — references to fetch (default `3`)
+   - `source` (optional) — upstream service: `auto` (default), `relisten`,
+     `archive`, or `youtube`
+   - `band_recording_url` (optional) — direct URL (e.g. Dropbox) to a band
+     reference; joins the downloaded references for blending
+   - `commit_template` (optional, default true) — commits the finished
+     template to `web/templates/` so GitHub Pages redeploys automatically
+
+   If you fill in both `show` and `era`, `era` is ignored. If both are blank,
+   the workflow logs a warning and falls back to "most popular SBDs".
+
+   `show` and `era` both accept natural-language values:
+
+   | Example | Notes |
+   | --- | --- |
+   | `1977` | bare year (±1 yr tolerance) |
+   | `1977-1981` | inclusive range — useful when an arrangement is era-specific |
+   | `May 1977` / `1977-05` | month + year |
+   | `5/8/77` / `May 8 1977` / `1977-05-08` | specific date |
+   | `Cornell` / `Barton Hall` / `New Haven` | venue / city |
+   | `Dick's Picks 25` | famous-show keyword |
+   | `Brent era` / `Europe 72` / `Wall of Sound` | era keywords |
+   | `5/5/77 New Haven` | free-form combo |
+
+4. Two artifacts come out: `references-<song>` (the source MP3s + a
+   `manifest.json`) and `template-<song>` (the final JSON). When
+   `commit_template` is on, the template is also pushed to the triggering
+   branch.
 
 Behind the scenes the workflow runs `tooling/fetch_references.py` to pull
-2–5 references, then `tooling/build_song.py` to align each one and blend
+the references, then `tooling/build_song.py` to align each one and blend
 their MERT (or wav2vec2 fallback) embeddings into a single template.
 
 For a fully manual build (e.g. with your own reference set):

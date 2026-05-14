@@ -62,26 +62,97 @@ def _l2_norm(v: np.ndarray) -> np.ndarray:
     return v if n < 1e-9 else v / n
 
 
+FORMAT_EXTENSIONS = {
+    "mp3": ".mp3",
+    "mp4": ".m4a",
+    "wav": ".wav",
+    "flac": ".flac",
+    "ogg": ".ogg",
+    "aac": ".aac",
+    "caf": ".caf",
+}
+
+
+def _detect_audio_format(path: Path) -> Optional[str]:
+    """Sniff the actual container format from file magic bytes.
+
+    Returns one of: 'mp3', 'mp4', 'wav', 'flac', 'ogg', 'aac', 'caf',
+    or None if the header doesn't match anything we know.
+    """
+    with open(path, "rb") as f:
+        header = f.read(64)
+    if header.startswith(b"ID3"):
+        return "mp3"
+    # AAC's ADTS sync (\xff\xf1 / \xff\xf9) also satisfies the loose MP3 rule
+    # below, so check AAC first.
+    if header.startswith(b"\xff\xf1") or header.startswith(b"\xff\xf9"):
+        return "aac"
+    if len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0:
+        return "mp3"
+    if b"ftyp" in header[:20]:
+        return "mp4"   # m4a, mp4, voice memos
+    if header.startswith(b"RIFF") and b"WAVE" in header[:12]:
+        return "wav"
+    if header.startswith(b"fLaC"):
+        return "flac"
+    if header.startswith(b"OggS"):
+        return "ogg"   # ogg vorbis or opus
+    if header.startswith(b"caff"):
+        return "caf"   # Apple Core Audio
+    return None
+
+
 def _load_audio(path: Path, sr: int = EMBED_SR) -> np.ndarray:
     """Decode `path` to mono float32 at `sr`, going through ffmpeg first.
 
     librosa+audioread chokes on some non-studio MP3 encodings (the rehearsal
     recording that triggered this divided by a sample_rate of 0). Pre-converting
-    to a clean WAV via ffmpeg sidesteps that path entirely. We also ffprobe
-    the file up front and log what's in it so the next time something breaks
-    we know what we were looking at.
+    to a clean WAV via ffmpeg sidesteps that path entirely. We also sniff the
+    container format from magic bytes up front so a misleading filename
+    extension (or no extension at all) doesn't trip ffmpeg's autodetection,
+    and ffprobe the (possibly renamed) file so the workflow log records
+    what we actually got.
     """
     import json as _json
     import os
+    import shutil
     import subprocess
     import tempfile
 
     import librosa
 
+    detected = _detect_audio_format(path)
+    print(
+        f"  detected audio format: {detected or 'unknown'} "
+        f"(filename was: {path.name})",
+        flush=True,
+    )
+
+    cleanup_paths: list[str] = []
+    probe_path = str(path)
+    if detected is not None:
+        target_ext = FORMAT_EXTENSIONS[detected]
+        if path.suffix.lower() != target_ext:
+            renamed = tempfile.NamedTemporaryFile(suffix=target_ext, delete=False)
+            renamed.close()
+            shutil.copy(str(path), renamed.name)
+            probe_path = renamed.name
+            cleanup_paths.append(renamed.name)
+            print(
+                f"  copied to {Path(renamed.name).name} so ffmpeg sees the "
+                f"right extension",
+                flush=True,
+            )
+    else:
+        print(
+            "  could not identify format from magic bytes; trying ffmpeg anyway",
+            flush=True,
+        )
+
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-print_format", "json",
-             "-show_format", "-show_streams", str(path)],
+             "-show_format", "-show_streams", probe_path],
             capture_output=True, text=True, check=True,
         )
         meta = _json.loads(probe.stdout)
@@ -100,16 +171,18 @@ def _load_audio(path: Path, sr: int = EMBED_SR) -> np.ndarray:
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
         wav_path = tf.name
+    cleanup_paths.append(wav_path)
     try:
         subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", probe_path,
              "-ar", str(sr), "-ac", "1", "-f", "wav", wav_path],
             check=True,
         )
         y, _ = librosa.load(wav_path, sr=sr, mono=True)
     finally:
-        if os.path.exists(wav_path):
-            os.unlink(wav_path)
+        for p in cleanup_paths:
+            if os.path.exists(p):
+                os.unlink(p)
     return y
 
 

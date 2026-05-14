@@ -60,8 +60,9 @@ jobs:
           fi
           mkdir -p validation
           echo "Downloading audio from: $url"
-          curl -L --fail --max-time 600 -o validation/band_recording.mp3 "$url"
-          ls -la validation/band_recording.mp3
+          # No extension on purpose: the script sniffs format from magic bytes.
+          curl -L --fail --max-time 600 -o validation/band_recording "$url"
+          ls -la validation/band_recording
 
       - name: Run validate_position
         env:
@@ -75,7 +76,7 @@ jobs:
           fi
           python tooling/validate_position.py \
             --template "$TEMPLATE" \
-            --audio validation/band_recording.mp3 \
+            --audio validation/band_recording \
             --out "validation/${SLUG}_validation" \
             -v
           ls -la validation/

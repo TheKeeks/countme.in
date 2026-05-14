@@ -88,6 +88,13 @@ async function openSong(songId) {
 
   showScreen('prompter');
   setCurrentLine(null, null); // start with nothing highlighted
+
+  const firstSection = template.structure.find(s => s.lines && s.lines.length > 0);
+  if (firstSection) {
+    document.fonts.ready.then(() => {
+      setCurrentLine(firstSection.section_id, firstSection.lines[0].line_index);
+    });
+  }
 }
 
 function updateTrackingStatus(s) {

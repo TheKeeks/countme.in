@@ -76,13 +76,31 @@ own.
 
 ## Adding a new song
 
-See `docs/HOW-TO-ADD-A-SONG.md`. Short version:
+The easiest path is the **Add a song** GitHub Actions workflow. It runs on
+GitHub's cloud, so it has the outbound internet access the reference
+downloader needs.
+
+1. Go to the repo's **Actions** tab on GitHub.
+2. Pick **Add a song** from the workflow list on the left.
+3. Click **Run workflow** in the top-right. Fill in:
+   - `song` (required) — slug or name, e.g. `peggy-o`
+   - `query` (optional) — natural-language match, e.g. `5/5/77 New Haven`
+   - `count` (optional) — how many references to fetch (default `2`)
+   - `era` (optional) — year range like `1977-1981`
+   - `source` (optional) — `auto` (default), `relisten`, `archive`, or `youtube`
+4. Hit the green **Run workflow** button and wait ~1–2 minutes.
+5. Open the finished run and download the `references-<song>` artifact from
+   the **Artifacts** section — it contains the MP3s plus a `manifest.json`.
+
+Then locally, finish the template build:
 
 1. Write a `.lyrics` file describing the song's section structure and lyric lines
-2. Drop a reference recording (board tape, studio cut) alongside it
+2. Drop one of the downloaded references next to it (or use whatever audio you prefer)
 3. Run `python tooling/template_builder.py` then `python tooling/alignment.py`
 4. Copy the resulting `*_aligned.json` into `web/templates/`
 5. Add its filename to the `TEMPLATE_INDEX` array in `web/js/template-loader.js`
+
+See `docs/HOW-TO-ADD-A-SONG.md` for the long form.
 
 ## Running the web app locally
 

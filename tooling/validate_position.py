@@ -18,7 +18,13 @@ place. Writes three sibling reports with the same prefix:
 
 Used to validate the embedding-matching approach end-to-end before we
 port it into the browser runtime. Out of scope here: line-level
-prediction, whisper fusion, HMM smoothing.
+prediction and whisper fusion.
+
+Adds an optional Viterbi smoothing pass on top of the per-window
+argmax: a small section-order prior pulls the predicted sequence
+toward "stay in this section, or move on to the next one", which
+rescues short bursts of confusion between sections that sound alike.
+Disable with `--transition-penalty 0.0`.
 
 CLI:
     python tooling/validate_position.py \\
@@ -204,15 +210,89 @@ def _collect_section_frames(template: dict) -> list[tuple[str, str, np.ndarray]]
 
 
 def _score_window(query_vec: np.ndarray,
-                  sections: list[tuple[str, str, np.ndarray]]
-                  ) -> list[tuple[str, str, float]]:
-    """Rank every section by its max-cosine-sim against the query window."""
-    ranked: list[tuple[str, str, float]] = []
-    for sid, stype, frames in sections:
-        sims = frames @ query_vec  # both sides L2-normed -> dot == cos
-        ranked.append((sid, stype, float(sims.max())))
-    ranked.sort(key=lambda x: -x[2])
-    return ranked
+                  sections: list[tuple[str, str, np.ndarray]]) -> np.ndarray:
+    """Max-cosine similarity per section. Returns shape (n_sections,)."""
+    out = np.empty(len(sections), dtype=np.float32)
+    for i, (_sid, _stype, frames) in enumerate(sections):
+        out[i] = float((frames @ query_vec).max())
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Viterbi smoothing
+# ---------------------------------------------------------------------------
+
+SOFTMAX_TEMPERATURE = 0.1
+FORWARD_LOG_PROB = -1.0
+
+
+def _log_emissions(sims_matrix: np.ndarray,
+                   temperature: float = SOFTMAX_TEMPERATURE) -> np.ndarray:
+    """Per-window softmax(sims/T) in log space. Shape (W, S) -> (W, S)."""
+    scaled = sims_matrix / temperature
+    # logsumexp along axis=1, numerically stable.
+    m = scaled.max(axis=1, keepdims=True)
+    lse = m.squeeze(-1) + np.log(np.exp(scaled - m).sum(axis=1))
+    return scaled - lse[:, None]
+
+
+def _transition_log_probs(n_sections: int, transition_penalty: float) -> np.ndarray:
+    """log P(j | i) under the simple section-order prior.
+
+    Stay-in-section: 0. Forward to the next section in song order: -1.0.
+    Any other jump (including backward): -transition_penalty.
+    The last section has no "next", so all off-diagonals from it pay the
+    full penalty.
+    """
+    t = np.full((n_sections, n_sections), -transition_penalty, dtype=np.float64)
+    for i in range(n_sections):
+        t[i, i] = 0.0
+        if i + 1 < n_sections:
+            t[i, i + 1] = FORWARD_LOG_PROB
+    return t
+
+
+def _viterbi(log_emissions: np.ndarray,
+             log_transitions: np.ndarray) -> np.ndarray:
+    """Standard Viterbi. log_emissions: (W, S). log_transitions: (S, S).
+
+    Returns the most-likely state sequence as a (W,) int array.
+    """
+    n_windows, n_states = log_emissions.shape
+    if n_windows == 0:
+        return np.zeros(0, dtype=np.int32)
+    dp = np.empty((n_windows, n_states), dtype=np.float64)
+    back = np.zeros((n_windows, n_states), dtype=np.int32)
+    dp[0] = log_emissions[0]
+    for t in range(1, n_windows):
+        # scores[prev, curr] = dp[t-1, prev] + log P(curr | prev)
+        scores = dp[t - 1][:, None] + log_transitions
+        back[t] = scores.argmax(axis=0)
+        dp[t] = scores.max(axis=0) + log_emissions[t]
+    seq = np.empty(n_windows, dtype=np.int32)
+    seq[-1] = int(dp[-1].argmax())
+    for t in range(n_windows - 2, -1, -1):
+        seq[t] = back[t + 1, seq[t + 1]]
+    return seq
+
+
+def _count_changes(seq) -> int:
+    return sum(1 for i in range(1, len(seq)) if seq[i] != seq[i - 1])
+
+
+def _mean_run_length_sec(seq, hop_sec: float) -> float:
+    if not len(seq):
+        return 0.0
+    n_runs = 1 + _count_changes(seq)
+    return len(seq) * hop_sec / n_runs
+
+
+def _changed_pct(raw_seq, smoothed_seq) -> float:
+    n = len(raw_seq)
+    if n == 0:
+        return 0.0
+    diffs = sum(1 for r, s in zip(raw_seq, smoothed_seq) if r != s)
+    return 100.0 * diffs / n
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +324,8 @@ def _fmt_mmss(t: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path) -> None:
+def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path,
+             smooth_enabled: bool = False) -> None:
     n = len(rows)
     by_section = Counter(r["pred_id"] for r in rows)
     overall_conf = sum(r["conf"] for r in rows) / max(1, n)
@@ -293,6 +374,25 @@ def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path) -> 
     else:
         out.append("_None._")
 
+    if smooth_enabled:
+        raw_seq = [r["pred_id"] for r in rows]
+        smooth_seq = [r["smoothed_id"] for r in rows]
+        raw_changes = _count_changes(raw_seq)
+        smooth_changes = _count_changes(smooth_seq)
+        raw_run = _mean_run_length_sec(raw_seq, HOP_SEC)
+        smooth_run = _mean_run_length_sec(smooth_seq, HOP_SEC)
+        out += [
+            "",
+            "## Smoothing summary",
+            "",
+            f"- Raw: {raw_changes} section changes, "
+            f"mean run length {raw_run:.1f}s",
+            f"- Smoothed: {smooth_changes} section changes, "
+            f"mean run length {smooth_run:.1f}s",
+            f"- Predictions changed by smoothing: "
+            f"{_changed_pct(raw_seq, smooth_seq):.1f}%",
+        ]
+
     out += ["", "## Timeline (every 5s)", ""]
     last_t = -10.0
     for r in rows:
@@ -302,6 +402,16 @@ def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path) -> 
                 f"(conf={r['conf']:.2f}, margin={r['margin']:.2f})"
             )
             last_t = r["time"]
+
+    if smooth_enabled:
+        out += ["", "## Smoothed timeline (every 5s)", ""]
+        last_t = -10.0
+        for r in rows:
+            if r["time"] - last_t >= 5.0:
+                out.append(
+                    f"- `{_fmt_mmss(r['time'])}` → **{r['smoothed_id']}**"
+                )
+                last_t = r["time"]
 
     path.write_text("\n".join(out) + "\n")
 
@@ -317,7 +427,8 @@ def _section_color(i: int, n: int) -> str:
 
 
 def write_html(rows: list[dict], path: Path, template: dict,
-               audio_path: Path, sections: list[tuple[str, str, np.ndarray]]) -> None:
+               audio_path: Path, sections: list[tuple[str, str, np.ndarray]],
+               smooth_enabled: bool = False) -> None:
     section_ids = [sid for sid, _stype, _frames in sections]
     color_map = {sid: _section_color(i, len(section_ids))
                  for i, sid in enumerate(section_ids)}
@@ -329,9 +440,33 @@ def write_html(rows: list[dict], path: Path, template: dict,
         return
 
     px_per_sec = 8
-    chart_height = 60
     total_time = rows[-1]["time"] + WINDOW_SEC
     chart_width = int(total_time * px_per_sec) + 20
+    block_w = HOP_SEC * px_per_sec
+
+    # Layout: optional "Raw" / "Smoothed" labels above each strip, then the
+    # block row(s), then the time axis. The single-row chart matches the
+    # pre-smoothing layout byte-for-byte so --transition-penalty 0.0 keeps
+    # output identical.
+    if smooth_enabled:
+        strip_h = 32
+        row_gap = 28
+        raw_label_y = 14
+        raw_y = 20
+        smooth_label_y = raw_y + strip_h + row_gap - 8
+        smooth_y = raw_y + strip_h + row_gap
+        axis_top = smooth_y + strip_h + 4
+        chart_height = axis_top + 24
+        tick_text_offset = 14
+        svg_height = chart_height
+    else:
+        # Match the pre-smoothing layout byte-for-byte so penalty=0 keeps
+        # the existing output exactly.
+        strip_h = 48
+        raw_y = 6
+        axis_top = raw_y + strip_h + 6  # 60
+        tick_text_offset = 18
+        svg_height = axis_top + 30      # 90
 
     template_name = template.get("song_id") or "?"
     parts: list[str] = [
@@ -353,32 +488,50 @@ def write_html(rows: list[dict], path: Path, template: dict,
         f'&middot; {len(rows)} windows '
         f'&middot; {WINDOW_SEC}s window, {HOP_SEC}s hop</p>',
         '<div class="chart">',
-        f'<svg width="{chart_width}" height="{chart_height + 30}" '
+        f'<svg width="{chart_width}" height="{svg_height}" '
         'xmlns="http://www.w3.org/2000/svg">',
     ]
 
-    # Time axis ticks every 30 seconds.
+    # Time axis ticks every 30 seconds -- span both rows when smoothing is on.
     for t in range(0, int(total_time) + 1, 30):
         x = t * px_per_sec + 10
         parts.append(
-            f'<line x1="{x}" y1="0" x2="{x}" y2="{chart_height}" stroke="#ccc"/>'
+            f'<line x1="{x}" y1="0" x2="{x}" y2="{axis_top}" stroke="#ccc"/>'
         )
         parts.append(
-            f'<text x="{x}" y="{chart_height+18}" font-size="10" fill="#555">'
+            f'<text x="{x}" y="{axis_top + tick_text_offset}" font-size="10" fill="#555">'
             f'{_fmt_mmss(t)}</text>'
         )
 
-    # Window blocks: width = one hop so consecutive predictions tile cleanly.
-    block_w = HOP_SEC * px_per_sec
+    # Raw row.
+    if smooth_enabled:
+        parts.append(
+            f'<text x="10" y="{raw_label_y}" font-size="11" fill="#444" '
+            f'font-weight="600">Raw</text>'
+        )
     for r in rows:
         x = r["time"] * px_per_sec + 10
         color = color_map.get(r["pred_id"], "#999")
         opacity = max(0.15, min(1.0, r["conf"]))
         parts.append(
-            f'<rect x="{x:.1f}" y="6" width="{block_w:.1f}" '
-            f'height="{chart_height-12}" fill="{color}" '
+            f'<rect x="{x:.1f}" y="{raw_y}" width="{block_w:.1f}" '
+            f'height="{strip_h}" fill="{color}" '
             f'opacity="{opacity:.2f}"/>'
         )
+
+    # Smoothed row.
+    if smooth_enabled:
+        parts.append(
+            f'<text x="10" y="{smooth_label_y}" font-size="11" fill="#444" '
+            f'font-weight="600">Smoothed</text>'
+        )
+        for r in rows:
+            x = r["time"] * px_per_sec + 10
+            color = color_map.get(r["smoothed_id"], "#999")
+            parts.append(
+                f'<rect x="{x:.1f}" y="{smooth_y}" width="{block_w:.1f}" '
+                f'height="{strip_h}" fill="{color}" opacity="1.00"/>'
+            )
 
     parts.append('</svg></div>')
 
@@ -405,6 +558,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="Audio file to validate against (mp3/wav/m4a/...)")
     p.add_argument("--out", required=True,
                    help="Output path prefix; writes <out>.csv, .md, .html")
+    p.add_argument("--transition-penalty", type=float, default=3.0,
+                   help="Viterbi log-penalty for jumps that are not "
+                        "stay-in-section or forward-to-next-section. 0.0 "
+                        "disables smoothing entirely (default 3.0).")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -441,8 +598,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     expected = max(0, int((duration - WINDOW_SEC) / HOP_SEC) + 1)
     log.info("Scoring %d windows ...", expected)
 
-    rows: list[dict] = []
+    # Collect per-window similarities into a (W, S) matrix so we can run
+    # Viterbi over them after the loop. Discarding the matrix and keeping
+    # only the argmax was the bug that prevented smoothing.
+    times: list[float] = []
+    sims_rows: list[np.ndarray] = []
     t = 0.0
+    scored = 0
     while t + WINDOW_SEC <= duration:
         s0 = int(t * EMBED_SR)
         s1 = int((t + WINDOW_SEC) * EMBED_SR)
@@ -452,22 +614,53 @@ def main(argv: Optional[list[str]] = None) -> int:
             t += HOP_SEC
             continue
         q = _l2_norm(emb)
-        ranked = _score_window(q, sections)
-        top_score = ranked[0][2]
-        second_score = ranked[1][2] if len(ranked) > 1 else 0.0
-        rows.append({
-            "time": t,
-            "pred_id": ranked[0][0],
-            "pred_type": ranked[0][1],
-            "conf": top_score,
-            "margin": top_score - second_score,
-            "top3": ranked[:3],
-        })
-        if args.verbose and len(rows) % 100 == 0:
-            log.debug("  scored %d windows ...", len(rows))
+        sims_rows.append(_score_window(q, sections))
+        times.append(t)
+        scored += 1
+        if args.verbose and scored % 100 == 0:
+            log.debug("  scored %d windows ...", scored)
         t += HOP_SEC
 
-    log.info("Scored %d windows.", len(rows))
+    log.info("Scored %d windows.", scored)
+
+    smooth_enabled = args.transition_penalty > 0.0
+
+    if scored == 0:
+        sims_matrix = np.zeros((0, len(sections)), dtype=np.float32)
+        raw_idx = np.zeros(0, dtype=np.int32)
+        smoothed_idx = np.zeros(0, dtype=np.int32)
+    else:
+        sims_matrix = np.stack(sims_rows, axis=0)
+        raw_idx = sims_matrix.argmax(axis=1).astype(np.int32)
+        if smooth_enabled:
+            log_em = _log_emissions(sims_matrix)
+            log_tr = _transition_log_probs(len(sections), args.transition_penalty)
+            smoothed_idx = _viterbi(log_em, log_tr)
+            log.info("Viterbi smoothing on (transition_penalty=%.2f).",
+                     args.transition_penalty)
+        else:
+            smoothed_idx = raw_idx.copy()
+
+    rows: list[dict] = []
+    for w in range(scored):
+        sims = sims_matrix[w]
+        order = np.argsort(-sims)
+        top3 = [(sections[int(i)][0], sections[int(i)][1], float(sims[int(i)]))
+                for i in order[:3]]
+        raw_i = int(raw_idx[w])
+        sm_i = int(smoothed_idx[w])
+        confidence = float(sims[raw_i])
+        second = float(sims[int(order[1])]) if len(order) > 1 else 0.0
+        rows.append({
+            "time": times[w],
+            "pred_id": sections[raw_i][0],
+            "pred_type": sections[raw_i][1],
+            "conf": confidence,
+            "margin": confidence - second,
+            "top3": top3,
+            "smoothed_id": sections[sm_i][0],
+            "smoothed_type": sections[sm_i][1],
+        })
 
     out_prefix = Path(args.out)
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -476,8 +669,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     html_path = out_prefix.with_suffix(".html")
 
     write_csv(rows, csv_path)
-    write_md(rows, md_path, template, args.audio)
-    write_html(rows, html_path, template, args.audio, sections)
+    write_md(rows, md_path, template, args.audio, smooth_enabled=smooth_enabled)
+    write_html(rows, html_path, template, args.audio, sections,
+               smooth_enabled=smooth_enabled)
 
     print(f"\nWrote {csv_path}, {md_path.name}, {html_path.name} ({len(rows)} windows)")
     return 0

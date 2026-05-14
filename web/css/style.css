@@ -1,0 +1,461 @@
+/* ============================================================
+ * countme.in — stylesheet
+ * ----------------------------------------------------------
+ * Aesthetic notes:
+ *   - On-stage prompter view is austere: near-black background,
+ *     huge legible type, minimal chrome. Legibility at distance
+ *     wins over everything.
+ *   - Home / settings screens lean warmer — cream paper, deep
+ *     burgundy accents, a touch of 70s concert poster.
+ *   - Two typefaces only: a characterful display (Fraunces) for
+ *     branding, and a workhorse for body / lyrics (Inter Tight).
+ * ========================================================= */
+
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700;9..144,900&family=Inter+Tight:wght@400;500;600;800&display=swap');
+
+:root {
+  /* Palette: warm "concert poster" tones for home / settings */
+  --paper:        #f4ead5;
+  --paper-deep:   #e8d9b8;
+  --ink:          #1a1410;
+  --ink-soft:     #5c4a3a;
+  --burgundy:     #8b1a1a;
+  --burgundy-deep:#5e0f0f;
+  --gold:         #c89b3c;
+
+  /* Palette: ascetic stage view */
+  --stage-bg:     #0a0a0a;
+  --stage-bg-2:   #141414;
+  --stage-dim:    #3a3a3a;
+  --stage-text:   #f0e6d0;
+  --stage-active: #ffd866;     /* current line glow */
+  --stage-next:   #f0e6d0;
+  --stage-past:   #5a5346;
+
+  /* Type scale */
+  --type-display: 'Fraunces', 'Times New Roman', serif;
+  --type-body:    'Inter Tight', system-ui, sans-serif;
+  --lyric-size:   64px;   /* updated by settings slider */
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--type-body);
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+  touch-action: manipulation;
+}
+
+body {
+  /* Subtle paper texture via layered gradients — no image dependency */
+  background:
+    radial-gradient(circle at 18% 12%, rgba(200,155,60,0.07) 0%, transparent 38%),
+    radial-gradient(circle at 82% 78%, rgba(139,26,26,0.06) 0%, transparent 42%),
+    var(--paper);
+}
+
+.screen {
+  display: none;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+}
+.screen.active { display: flex; flex-direction: column; }
+
+/* ---------- HOME SCREEN -------------------------------------------- */
+
+.home-header {
+  padding: 4rem 2rem 2rem;
+  text-align: center;
+}
+
+.logo {
+  display: inline-flex;
+  align-items: center;
+  gap: 1rem;
+  font-family: var(--type-display);
+  font-weight: 900;
+  font-size: 3rem;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  margin: 0;
+  color: var(--ink);
+}
+.logo-mark {
+  font-size: 3.2rem;
+  color: var(--burgundy);
+  transform: translateY(-2px);
+}
+.logo-text { text-align: left; }
+.logo-dot {
+  color: var(--burgundy);
+  display: inline-block;
+  transform: translateY(-0.05em);
+}
+
+.tagline {
+  margin: 1.5rem 0 0;
+  font-style: italic;
+  color: var(--ink-soft);
+  font-size: 1rem;
+  max-width: 32ch;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.home-main {
+  flex: 1;
+  padding: 1rem 2rem 2rem;
+  overflow-y: auto;
+}
+
+.section-label {
+  font-family: var(--type-display);
+  font-weight: 500;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--ink-soft);
+  border-bottom: 1px solid var(--paper-deep);
+  padding-bottom: 0.5rem;
+  margin: 0 0 1rem;
+}
+
+.song-list { list-style: none; padding: 0; margin: 0; }
+.song-list li {
+  padding: 1.1rem 0;
+  border-bottom: 1px solid var(--paper-deep);
+  font-family: var(--type-display);
+  font-weight: 700;
+  font-size: 1.6rem;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition: color 0.18s, transform 0.18s;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.song-list li:hover, .song-list li:active { color: var(--burgundy); transform: translateX(4px); }
+.song-list-meta {
+  font-family: var(--type-body);
+  font-weight: 400;
+  font-size: 0.85rem;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+.song-list-loading {
+  color: var(--ink-soft);
+  font-style: italic;
+  font-size: 1rem;
+  font-family: var(--type-body);
+  font-weight: 400;
+  border: none !important;
+  cursor: default !important;
+}
+.song-list-loading:hover { color: var(--ink-soft) !important; transform: none !important; }
+
+.home-footer {
+  padding: 1.2rem 2rem 2rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-top: 1px solid var(--paper-deep);
+}
+
+.text-button {
+  background: none;
+  border: none;
+  font-family: var(--type-body);
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  padding: 0.4rem 0;
+}
+.text-button:hover { color: var(--ink); }
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--burgundy);
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--burgundy);
+  border-radius: 999px;
+  background: rgba(139, 26, 26, 0.04);
+}
+.status-pill::before {
+  content: '';
+  width: 6px; height: 6px;
+  background: var(--burgundy);
+  border-radius: 50%;
+  display: inline-block;
+}
+
+/* ---------- PROMPTER (stage) SCREEN -------------------------------- */
+
+#screen-prompter {
+  background: var(--stage-bg);
+  color: var(--stage-text);
+  position: relative;
+  overflow: hidden;
+}
+
+.lyric-viewport {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 3rem;
+  overflow: hidden;
+  position: relative;
+}
+
+.lyric-stack {
+  width: 100%;
+  max-width: 22ch;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6em;
+  text-align: center;
+  font-family: var(--type-body);
+  font-weight: 500;
+  font-size: var(--lyric-size);
+  line-height: 1.18;
+  letter-spacing: -0.01em;
+  transition: transform 0.45s cubic-bezier(0.3, 0.7, 0.2, 1);
+}
+
+.lyric-line {
+  width: 100%;
+  transition: color 0.35s, opacity 0.35s, transform 0.35s;
+}
+.lyric-line[data-state="past"]    { color: var(--stage-past); opacity: 0.45; }
+.lyric-line[data-state="next"]    { color: var(--stage-next); opacity: 0.7; font-weight: 500; }
+.lyric-line[data-state="current"] {
+  color: var(--stage-active);
+  opacity: 1;
+  font-weight: 600;
+  text-shadow: 0 0 24px rgba(255, 216, 102, 0.18);
+}
+.lyric-line[data-state="far-future"] { color: var(--stage-dim); opacity: 0.25; }
+.lyric-line[data-kind="section-marker"] {
+  font-family: var(--type-display);
+  font-style: italic;
+  font-weight: 500;
+  font-size: 0.4em;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--stage-dim);
+  margin: 0.3em 0;
+}
+
+/* Tap-to-reveal zone */
+.control-reveal-zone {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 8vh;
+  z-index: 10;
+}
+
+.control-panel {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  background: linear-gradient(to bottom, rgba(0,0,0,0.95), rgba(0,0,0,0.85) 70%, transparent);
+  padding: 1.2rem 1.5rem 2rem;
+  transform: translateY(-110%);
+  transition: transform 0.3s ease;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+.control-panel.visible { transform: translateY(0); }
+
+.control-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.control-row-secondary {
+  justify-content: center;
+  padding-top: 0.5rem;
+}
+
+.song-info {
+  flex: 1;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+#current-song-title {
+  font-family: var(--type-display);
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--stage-text);
+  letter-spacing: -0.01em;
+}
+.tracking-status {
+  font-size: 0.7rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--stage-dim);
+}
+.tracking-status[data-state="listening"] { color: var(--stage-active); }
+.tracking-status[data-state="locked"]    { color: #6abd6a; }
+.tracking-status[data-state="lost"]      { color: var(--burgundy); }
+
+.ctrl-btn {
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.15);
+  color: var(--stage-text);
+  width: 3rem; height: 3rem;
+  border-radius: 50%;
+  font-size: 1.4rem;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--type-body);
+  transition: background 0.15s;
+}
+.ctrl-btn:hover { background: rgba(255,255,255,0.16); }
+.ctrl-btn-primary {
+  background: var(--burgundy);
+  border-color: var(--burgundy);
+  color: var(--stage-text);
+}
+.ctrl-btn-primary.recording {
+  background: var(--stage-active);
+  border-color: var(--stage-active);
+  color: var(--stage-bg);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255,216,102,0.5); }
+  50%      { box-shadow: 0 0 0 12px rgba(255,216,102,0); }
+}
+.ctrl-btn-emergency {
+  width: auto;
+  height: auto;
+  border-radius: 999px;
+  padding: 0.55rem 1.4rem;
+  font-size: 0.8rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  border-color: var(--burgundy);
+  color: var(--burgundy);
+  background: transparent;
+}
+.ctrl-btn-emergency:hover {
+  background: var(--burgundy);
+  color: var(--stage-text);
+}
+
+/* Emergency overlay (line picker) */
+.emergency-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(10,10,10,0.97);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  transform: translateY(100%);
+  transition: transform 0.3s ease;
+  padding: 1.5rem;
+}
+.emergency-overlay.visible { transform: translateY(0); }
+.emergency-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+}
+.emergency-header h2 {
+  font-family: var(--type-display);
+  font-weight: 500;
+  font-size: 1.2rem;
+  margin: 0;
+  color: var(--stage-text);
+}
+.emergency-header .text-button { color: var(--stage-dim); }
+.emergency-line-list {
+  list-style: none;
+  margin: 0;
+  padding: 1rem 0;
+  overflow-y: auto;
+  flex: 1;
+}
+.emergency-line-list li {
+  padding: 1rem 0.5rem;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  font-size: 1.2rem;
+  color: var(--stage-text);
+  cursor: pointer;
+}
+.emergency-line-list li[data-section-divider] {
+  font-family: var(--type-display);
+  font-style: italic;
+  font-size: 0.8rem;
+  color: var(--stage-dim);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  border: none;
+  padding: 1.2rem 0 0.3rem;
+  cursor: default;
+}
+.emergency-line-list li:hover:not([data-section-divider]) {
+  color: var(--stage-active);
+}
+
+/* ---------- SETTINGS ----------------------------------------------- */
+
+.settings-header {
+  padding: 2rem 2rem 1rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  border-bottom: 1px solid var(--paper-deep);
+}
+.settings-header h2 {
+  font-family: var(--type-display);
+  font-weight: 700;
+  font-size: 1.4rem;
+  margin: 0;
+}
+.settings-main { padding: 2rem; }
+.setting-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem 0;
+  border-bottom: 1px solid var(--paper-deep);
+}
+.setting-row label { font-weight: 500; }
+.setting-row input[type=range] { grid-column: 1 / -1; width: 100%; }
+.setting-row-info { color: var(--ink-soft); font-style: italic; }
+.info-value { font-family: var(--type-body); font-weight: 600; color: var(--ink); font-style: normal; }
+
+/* ---------- Small screens ------------------------------------------ */
+
+@media (max-width: 480px) {
+  .home-header { padding: 2.5rem 1.5rem 1.5rem; }
+  .home-main, .home-footer { padding-left: 1.5rem; padding-right: 1.5rem; }
+  .logo { font-size: 2.4rem; }
+  .song-list li { font-size: 1.4rem; }
+}

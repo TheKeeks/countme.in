@@ -1,0 +1,61 @@
+# peggy_o.lyrics
+# Grateful Dead arrangement of the traditional Scottish ballad.
+# Strophic structure: all verses (no separate chorus), one solo break.
+# Reference recording: Peggy_O_Feb_26_full_band.m4a (7:30, full band).
+
+[intro] elasticity=medium duration_range=10,40
+(instrumental, settles into the groove before verse 1)
+
+[verse 1] elasticity=low
+As we rode out to Fennario
+As we rode out to Fennario
+Our captain fell in love with a lady like a dove
+And he called her by name, pretty Peggy-O
+
+[verse 2] elasticity=low
+Will you marry me pretty Peggy-O
+Will you marry me pretty Peggy-O
+If you will marry me I'll set your cities free
+And free all the ladies in the area-O
+
+[verse 3] elasticity=low
+I would marry you sweet William-O
+I would marry you sweet William-O
+I would marry you but your guineas are too few
+And I fear my mama would be angry-O
+
+[verse 4] elasticity=low
+What would your mama think pretty Peggy-O
+What would your mama think pretty Peggy-O
+What would your mama think if she heard my guineas clink
+Saw me marching at the head of my soldiers-O
+
+[jam] elasticity=high duration_range=60,300
+(instrumental solo -- length varies between shows)
+
+[verse 5] elasticity=low
+If ever I return pretty Peggy-O
+If ever I return pretty Peggy-O
+If ever I return your cities I will burn
+Destroy all the ladies in the area-O
+
+[verse 6] elasticity=low
+Come steppin' down the stairs pretty Peggy-O
+Come steppin' down the stairs pretty Peggy-O
+Come steppin' down the stairs combin' back your yellow hair
+Bid a last farewell to your William-O
+
+[verse 7] elasticity=low
+Sweet William he is dead pretty Peggy-O
+Sweet William he is dead pretty Peggy-O
+Sweet William he is dead and he died for a maid
+And he's buried in the Louisiana country-O
+
+[verse 8] elasticity=low
+As we rode out to Fennario
+As we rode out to Fennario
+Our captain fell in love with a lady like a dove
+And he called her by name, pretty Peggy-O
+
+[outro] elasticity=medium duration_range=5,30
+(final phrase, tag, ritard)

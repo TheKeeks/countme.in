@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
+  <meta name="theme-color" content="#0a0a0a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="countme.in" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="css/style.css" />
+  <title>countme.in</title>
+</head>
+<body>
+  <!-- HOME SCREEN: pick a song -->
+  <section id="screen-home" class="screen active">
+    <header class="home-header">
+      <h1 class="logo">
+        <span class="logo-mark">◐</span>
+        <span class="logo-text">countme<span class="logo-dot">.</span>in</span>
+      </h1>
+      <p class="tagline">AI-tracked lyrics for the band that plays it different every night</p>
+    </header>
+
+    <main class="home-main">
+      <h2 class="section-label">Setlist</h2>
+      <ul id="song-list" class="song-list">
+        <li class="song-list-loading">loading songs…</li>
+      </ul>
+    </main>
+
+    <footer class="home-footer">
+      <button id="btn-settings" class="text-button">settings</button>
+      <span class="status-pill" id="status-pill">offline-ready</span>
+    </footer>
+  </section>
+
+  <!-- PROMPTER SCREEN: the actual on-stage view -->
+  <section id="screen-prompter" class="screen">
+    <!-- The main lyric scroll area -->
+    <div id="lyric-viewport" class="lyric-viewport">
+      <div id="lyric-stack" class="lyric-stack">
+        <!-- Lines injected here -->
+      </div>
+    </div>
+
+    <!-- Top edge: tap to reveal controls -->
+    <div id="control-reveal-zone" class="control-reveal-zone" aria-label="Tap to show controls"></div>
+
+    <!-- Slide-down control panel -->
+    <div id="control-panel" class="control-panel" aria-hidden="true">
+      <div class="control-row">
+        <button id="btn-back" class="ctrl-btn" aria-label="Back to song list">←</button>
+        <div class="song-info">
+          <span id="current-song-title">—</span>
+          <span id="tracking-status" class="tracking-status">idle</span>
+        </div>
+        <button id="btn-mic" class="ctrl-btn ctrl-btn-primary" aria-label="Start tracking">●</button>
+      </div>
+      <div class="control-row control-row-secondary">
+        <button id="btn-lost" class="ctrl-btn ctrl-btn-emergency">I'm lost</button>
+      </div>
+    </div>
+
+    <!-- EMERGENCY OVERLAY: list of all lines to tap-to-resync -->
+    <div id="emergency-overlay" class="emergency-overlay" aria-hidden="true">
+      <div class="emergency-header">
+        <h2>Tap the line you're on</h2>
+        <button id="btn-emergency-close" class="text-button">cancel</button>
+      </div>
+      <ul id="emergency-line-list" class="emergency-line-list">
+        <!-- Lines injected here -->
+      </ul>
+    </div>
+  </section>
+
+  <!-- SETTINGS SCREEN -->
+  <section id="screen-settings" class="screen">
+    <header class="settings-header">
+      <button id="btn-settings-back" class="text-button">← back</button>
+      <h2>Settings</h2>
+    </header>
+    <main class="settings-main">
+      <div class="setting-row">
+        <label for="font-size-slider">Font size</label>
+        <input type="range" id="font-size-slider" min="32" max="120" value="64" />
+        <span id="font-size-value">64px</span>
+      </div>
+      <div class="setting-row">
+        <label for="lookahead-slider">Lookahead (next-line preview lines)</label>
+        <input type="range" id="lookahead-slider" min="0" max="4" value="2" />
+        <span id="lookahead-value">2</span>
+      </div>
+      <div class="setting-row setting-row-info">
+        <span class="info-label">Model</span>
+        <span class="info-value" id="model-status">not loaded</span>
+      </div>
+      <div class="setting-row setting-row-info">
+        <span class="info-label">Cache</span>
+        <span class="info-value" id="cache-status">checking…</span>
+      </div>
+    </main>
+  </section>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

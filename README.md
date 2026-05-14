@@ -77,28 +77,45 @@ own.
 ## Adding a new song
 
 The easiest path is the **Add a song** GitHub Actions workflow. It runs on
-GitHub's cloud, so it has the outbound internet access the reference
-downloader needs.
+GitHub's cloud, so it has the outbound internet access the downloader and
+the HuggingFace model weights need.
 
-1. Go to the repo's **Actions** tab on GitHub.
-2. Pick **Add a song** from the workflow list on the left.
-3. Click **Run workflow** in the top-right. Fill in:
+1. Add a `tooling/songs/<song_slug>.lyrics` file describing the song's section
+   structure and lyric lines (see `docs/HOW-TO-ADD-A-SONG.md`).
+2. Go to the repo's **Actions** tab on GitHub.
+3. Pick **Add a song** from the workflow list on the left.
+4. Click **Run workflow** in the top-right. Fill in:
    - `song` (required) — slug or name, e.g. `peggy-o`
    - `query` (optional) — natural-language match, e.g. `5/5/77 New Haven`
    - `count` (optional) — how many references to fetch (default `2`)
    - `era` (optional) — year range like `1977-1981`
    - `source` (optional) — `auto` (default), `relisten`, `archive`, or `youtube`
-4. Hit the green **Run workflow** button and wait ~1–2 minutes.
-5. Open the finished run and download the `references-<song>` artifact from
-   the **Artifacts** section — it contains the MP3s plus a `manifest.json`.
+   - `band_recording_url` (optional) — direct URL (e.g. Dropbox share) to a
+     band reference recording; it joins the downloaded references for blending
+   - `commit_template` (optional) — when true (default), the finished template
+     is committed to `web/templates/` and auto-deploys to the live site
+5. Hit the green **Run workflow** button. Expect ~3–5 minutes (downloads,
+   Whisper, MERT embeddings).
+6. Two artifacts come out: `references-<song>` (the source MP3s) and
+   `template-<song>` (the final JSON). If `commit_template` was on, the
+   template is also in `web/templates/` on the triggering branch.
 
-Then locally, finish the template build:
+Behind the scenes the workflow runs `tooling/fetch_references.py` to pull
+2–5 references, then `tooling/build_song.py` to align each one and blend
+their MERT (or wav2vec2 fallback) embeddings into a single template.
 
-1. Write a `.lyrics` file describing the song's section structure and lyric lines
-2. Drop one of the downloaded references next to it (or use whatever audio you prefer)
-3. Run `python tooling/template_builder.py` then `python tooling/alignment.py`
-4. Copy the resulting `*_aligned.json` into `web/templates/`
-5. Add its filename to the `TEMPLATE_INDEX` array in `web/js/template-loader.js`
+For a fully manual build (e.g. with your own reference set):
+
+```bash
+python tooling/build_song.py \
+    --song peggy-o \
+    --references "tooling/references/peggy-o/*.mp3" \
+    --lyrics tooling/songs/peggy_o.lyrics \
+    --out web/templates/peggy_o_aligned.json
+```
+
+The single-reference `template_builder.py` + `alignment.py` scripts are
+still around for backwards compatibility — `build_song.py` wraps them.
 
 See `docs/HOW-TO-ADD-A-SONG.md` for the long form.
 

@@ -95,6 +95,13 @@ export function applyLookahead(n) {
  * Position the lyric stack so the line at `idx` sits at the vertical
  * center of the viewport. Uses transform (the viewport is overflow:hidden,
  * so native scrolling is a no-op).
+ *
+ * The translateY is computed *absolutely* from the line's static offset
+ * inside the stack — not as a delta from the current visual position. The
+ * stack has a CSS transition on `transform`, so reading getBoundingClientRect
+ * mid-animation returns the in-flight position while style.transform holds
+ * the target; mixing those two reference frames is what caused taps during
+ * a scroll to land far from the chosen line.
  */
 function positionStackForCurrent(idx) {
   const stack = document.getElementById('lyric-stack');
@@ -103,21 +110,12 @@ function positionStackForCurrent(idx) {
   const currentEl = renderedLines[idx]?.el;
   if (!currentEl) return;
 
-  // We measure positions relative to the stack's own coordinate space.
-  // The line's top relative to the stack:
-  const stackRect = stack.getBoundingClientRect();
-  const lineRect = currentEl.getBoundingClientRect();
-  const lineCenterY = lineRect.top + lineRect.height / 2;
-  const viewportRect = viewport.getBoundingClientRect();
-  const viewportCenterY = viewportRect.top + viewportRect.height / 2;
-
-  // How far the stack must move (in viewport space) to put line at viewport center.
-  const delta = viewportCenterY - lineCenterY;
-
-  // Existing transform Y (if any) to add to.
-  const m = stack.style.transform.match(/translateY\(([-\d.]+)px\)/);
-  const currentTy = m ? parseFloat(m[1]) : 0;
-  const newTy = currentTy + delta;
+  // The viewport applies padding:50vh — its content origin sits at the
+  // viewport's vertical center. The stack's untransformed top therefore
+  // already lines up with viewport center, so to put the line's center
+  // on that axis we translate by minus the line's center within the stack.
+  const lineCenterInStack = currentEl.offsetTop + currentEl.offsetHeight / 2;
+  const newTy = -lineCenterInStack;
   stack.style.transform = `translateY(${newTy}px)`;
 }
 

@@ -41,6 +41,39 @@ countme.in/
 - ⏸️ **Phase 4** (production polish): post-MVP. Multi-song setlists, model swapping,
   cloud-Whisper enhancement when Wi-Fi is available.
 
+## Auto-downloading references
+
+For the offline tooling, the template builder needs at least one reference
+recording per song. `tooling/fetch_references.py` grabs those automatically
+from Relisten.net, the Internet Archive `GratefulDead` collection, or
+YouTube (in that order — first source with usable hits wins).
+
+```bash
+# Two soundboards of Peggy-O, no preferences -- highest-rated SBDs win
+python tooling/fetch_references.py --song peggy-o --count 2
+
+# Restrict to a window
+python tooling/fetch_references.py --song peggy-o --count 2 --era 1977-1981
+
+# Natural-language query (primary entry point)
+python tooling/fetch_references.py --song peggy-o --query "New Haven 1977"
+python tooling/fetch_references.py --song scarlet-begonias --query "Cornell"
+python tooling/fetch_references.py --song peggy-o --query "5/8/77"
+python tooling/fetch_references.py --song peggy-o --query "May 10 1978"
+python tooling/fetch_references.py --song peggy-o --query "Dick's Picks 25"
+
+# Force a single source
+python tooling/fetch_references.py --song peggy-o --source archive --count 3
+
+# -v shows each candidate, its score, and why it was picked or skipped
+python tooling/fetch_references.py --song peggy-o --query "Cornell" -v
+```
+
+Files land in `tooling/references/<song_slug>/` along with a `manifest.json`
+recording where each MP3 came from. The directory is gitignored — these
+files are intermediate inputs for the template builder, not artifacts you
+own.
+
 ## Adding a new song
 
 See `docs/HOW-TO-ADD-A-SONG.md`. Short version:

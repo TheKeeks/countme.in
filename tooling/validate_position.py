@@ -63,8 +63,53 @@ def _l2_norm(v: np.ndarray) -> np.ndarray:
 
 
 def _load_audio(path: Path, sr: int = EMBED_SR) -> np.ndarray:
+    """Decode `path` to mono float32 at `sr`, going through ffmpeg first.
+
+    librosa+audioread chokes on some non-studio MP3 encodings (the rehearsal
+    recording that triggered this divided by a sample_rate of 0). Pre-converting
+    to a clean WAV via ffmpeg sidesteps that path entirely. We also ffprobe
+    the file up front and log what's in it so the next time something breaks
+    we know what we were looking at.
+    """
+    import json as _json
+    import os
+    import subprocess
+    import tempfile
+
     import librosa
-    y, _ = librosa.load(str(path), sr=sr, mono=True)
+
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json",
+             "-show_format", "-show_streams", str(path)],
+            capture_output=True, text=True, check=True,
+        )
+        meta = _json.loads(probe.stdout)
+        streams = meta.get("streams", [])
+        if streams:
+            s0 = streams[0]
+            print(
+                f"  audio metadata: codec={s0.get('codec_name')}, "
+                f"sample_rate={s0.get('sample_rate')}, "
+                f"channels={s0.get('channels')}, "
+                f"duration={meta.get('format', {}).get('duration')}",
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001 -- diagnostic only
+        print(f"  ffprobe failed (continuing anyway): {exc}", flush=True)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+        wav_path = tf.name
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
+             "-ar", str(sr), "-ac", "1", "-f", "wav", wav_path],
+            check=True,
+        )
+        y, _ = librosa.load(wav_path, sr=sr, mono=True)
+    finally:
+        if os.path.exists(wav_path):
+            os.unlink(wav_path)
     return y
 
 

@@ -4,7 +4,7 @@
   "description": "AI-tracked lyric teleprompter for live performance.",
   "start_url": "./",
   "display": "fullscreen",
-  "orientation": "landscape-primary",
+  "orientation": "any",
   "background_color": "#0a0a0a",
   "theme_color": "#0a0a0a",
   "icons": [

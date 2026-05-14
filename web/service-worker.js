@@ -11,7 +11,7 @@
  * existing client caches.
  */
 
-const CACHE_VERSION = 'v1';
+const CACHE_VERSION = 'v2';
 const SHELL_CACHE = `countme-in-shell-${CACHE_VERSION}`;
 const ASSET_CACHE = `countme-in-assets-${CACHE_VERSION}`;
 const MODEL_CACHE = `countme-in-models-${CACHE_VERSION}`;

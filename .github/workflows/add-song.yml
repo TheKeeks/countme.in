@@ -7,19 +7,24 @@ on:
         description: 'Song slug or name (e.g. peggy-o)'
         required: true
         type: string
-      query:
-        description: 'Optional natural-language query (e.g. "5/5/77 New Haven")'
+      show:
+        description: "Specific show (e.g. '5/8/77 Cornell', \"Dick's Picks 25\"). When set, fetches multiple mixes of THIS show."
         required: false
         type: string
+      era:
+        description: "Era/style (e.g. '1977', '1977-1981', 'May 1977', 'late 70s'). When set (and 'show' is empty), fetches different shows matching the era."
+        required: false
+        type: string
+      sources:
+        description: "Comma-separated allowlist of recording sources (default 'SBD,MATRIX'). Examples: 'SBD' soundboards only, 'SBD,AUD,MATRIX' to include audience tapes."
+        required: false
+        type: string
+        default: 'SBD,MATRIX'
       count:
         description: 'Number of references to fetch'
         required: false
         type: string
-        default: '2'
-      era:
-        description: 'Year range, e.g. 1977-1981'
-        required: false
-        type: string
+        default: '3'
       source:
         description: 'Which source to pull from'
         required: false
@@ -79,18 +84,21 @@ jobs:
         id: fetch
         env:
           SONG: ${{ inputs.song }}
-          QUERY: ${{ inputs.query }}
-          COUNT: ${{ inputs.count }}
+          SHOW: ${{ inputs.show }}
           ERA: ${{ inputs.era }}
+          SOURCES: ${{ inputs.sources }}
+          COUNT: ${{ inputs.count }}
           SOURCE: ${{ inputs.source }}
         run: |
           set -euo pipefail
           args=(--song "$SONG" --count "$COUNT" --source "$SOURCE" -v)
-          if [[ -n "${QUERY:-}" ]]; then
-            args+=(--query "$QUERY")
-          fi
-          if [[ -n "${ERA:-}" ]]; then
+          if [[ -n "${SHOW:-}" ]]; then
+            args+=(--show "$SHOW")
+          elif [[ -n "${ERA:-}" ]]; then
             args+=(--era "$ERA")
+          fi
+          if [[ -n "${SOURCES:-}" ]]; then
+            args+=(--sources "$SOURCES")
           fi
           python tooling/fetch_references.py "${args[@]}"
 

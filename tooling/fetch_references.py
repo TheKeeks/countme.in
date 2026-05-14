@@ -14,15 +14,27 @@ intentionally not checked in (see .gitignore).
 
 Usage
 -----
+    # Pin to a specific performance, pull multiple mixes of it:
     python tooling/fetch_references.py \\
-        --song peggy-o --count 2 [--era 1977-1981] \\
-        [--query "New Haven 1977"] [--source auto|relisten|archive|youtube]
+        --song peggy-o --count 3 --show "5/8/77 Cornell" \\
+        [--sources SBD,MATRIX]
 
-The --query flag is the primary natural-language entry point. Examples:
-    "New Haven 1977"  -> 5/5/77 New Haven Coliseum
-    "5/8/77"          -> Cornell, Barton Hall
-    "May 10 1978"     -> Veterans Memorial Coliseum
+    # Or pull different shows in an era / style:
+    python tooling/fetch_references.py \\
+        --song peggy-o --count 3 --era "1977-1981" \\
+        [--sources SBD,MATRIX]
+
+--show and --era both accept free-form text. Examples:
+    "1977"            -> any 1977 show (±1 yr window)
+    "1977-1981"       -> any show in the range
+    "May 1977"        -> May of 1977
+    "5/8/77"          -> the specific date
     "Cornell"         -> 5/8/77 Barton Hall
+    "Dick's Picks 25" -> 5/10/78
+    "Brent era"       -> 1979-1990
+
+--sources is a comma-separated allowlist of recording mix types
+(default: "SBD,MATRIX"). Use "SBD,AUD,MATRIX" to include audience tapes.
 """
 
 from __future__ import annotations
@@ -215,9 +227,43 @@ def parse_date_tokens(query: str) -> list[date]:
     return found
 
 
-def parse_year_only(query: str) -> Optional[int]:
-    """A bare 4-digit year like '1977' (not part of a date)."""
+def parse_year_range(query: Optional[str]) -> Optional[tuple[int, int]]:
+    """Detect `YYYY-YYYY` (e.g. `1977-1981`). Returns (lo, hi) or None."""
     if not query:
+        return None
+    m = re.search(r"\b(19[6-9]\d|20\d{2})\s*-\s*(19[6-9]\d|20\d{2})\b", query)
+    if not m:
+        return None
+    a, b = int(m.group(1)), int(m.group(2))
+    return (min(a, b), max(a, b))
+
+
+def parse_month_year(query: Optional[str]) -> Optional[tuple[int, int]]:
+    """Detect bare month/year refs like `May 1977` or `1977-05` (no day).
+
+    Skips full dates (`May 8 1977`, `1977-05-08`) which the date parser handles.
+    """
+    if not query:
+        return None
+    q = query.lower()
+    for m in re.finditer(
+        r"\b(" + "|".join(MONTHS.keys()) + r")[,\s]+(19[6-9]\d|20\d{2})\b", q
+    ):
+        return (MONTHS[m.group(1)], int(m.group(2)))
+    for m in re.finditer(
+        r"\b(19[6-9]\d|20\d{2})-(\d{1,2})\b(?!-\d)(?!\s*-\s*\d{4})", q
+    ):
+        month = int(m.group(2))
+        if 1 <= month <= 12:
+            return (month, int(m.group(1)))
+    return None
+
+
+def parse_year_only(query: str) -> Optional[int]:
+    """A bare 4-digit year like '1977' (not part of a YYYY-YYYY range)."""
+    if not query:
+        return None
+    if parse_year_range(query) is not None:
         return None
     for m in re.finditer(r"\b(19[6-9]\d|20\d{2})\b", query):
         return int(m.group(1))
@@ -225,8 +271,14 @@ def parse_year_only(query: str) -> Optional[int]:
 
 
 def query_target_year(query: Optional[str]) -> Optional[int]:
-    """Best guess at what year the query is asking for, for ±1 window filtering."""
+    """Best guess at what year the query is asking for, for ±1 window filtering.
+
+    Returns None when the query specifies a year range -- the range supersedes
+    the single-year ±1 window penalty.
+    """
     if not query:
+        return None
+    if parse_year_range(query) is not None:
         return None
     # Hand-curated keyword shortcuts win first -- otherwise something like
     # "Dick's Picks 25" gets day-parsed by dateutil into the current year.
@@ -240,10 +292,14 @@ def query_target_year(query: Optional[str]) -> Optional[int]:
     dates = parse_date_tokens(query)
     if dates:
         return dates[0].year
+    my = parse_month_year(query)
+    if my:
+        return my[1]
     return parse_year_only(query)
 
 
 YEAR_WINDOW_PENALTY = -100
+YEAR_RANGE_OUTSIDE_PENALTY = -50
 
 
 def score_candidate(cand: Candidate, query: Optional[str]) -> float:
@@ -251,14 +307,18 @@ def score_candidate(cand: Candidate, query: Optional[str]) -> float:
 
     Components:
         - Exact date match: +50
-        - Year match: +10
-        - Venue substring match: +20 (with partial credit for token overlap)
         - Keyword hits ("Cornell", "Dick's Picks"): +30
+        - Month+year match: +25 (same month and year)
+        - Venue substring match: up to +20 (token-overlap based)
+        - Single-year match: +10
+        - Month/year partial: +10 same year diff month, +5 same month diff year
+        - Year-in-range (YYYY-YYYY): +5
         - Era keyword: +5
         - Quality bias: SBD > MATRIX > AUD (+5/+3/+0)
-        - Year-window penalty: -100 when query implies a year and the
-          candidate is more than 1 year away. Keeps 1960s shows from
-          floating to the top of a 1977 query just because they're SBDs.
+        - Year-window penalty: -100 for single-year queries when the
+          candidate is more than 1 year away (skipped if a range was given).
+        - Year-out-of-range penalty: -50 for candidates outside an
+          explicit YYYY-YYYY range in the query.
     """
     cand.score = 0.0
     cand.score_reasons = []
@@ -283,6 +343,35 @@ def score_candidate(cand: Candidate, query: Optional[str]) -> float:
         return cand.score
 
     q = query.lower()
+    year_range = parse_year_range(query)
+    month_year = parse_month_year(query)
+
+    # Year range (e.g. "1977-1981"): in-range +5, out-of-range -50.
+    if year_range and cand.show_year is not None:
+        lo, hi = year_range
+        if lo <= cand.show_year <= hi:
+            mark(5, f"+5 year {cand.show_year} in range {lo}-{hi}")
+        else:
+            cand.score += YEAR_RANGE_OUTSIDE_PENALTY
+            cand.score_reasons.append(
+                f"{YEAR_RANGE_OUTSIDE_PENALTY} year {cand.show_year} outside {lo}-{hi}"
+            )
+
+    # Month/year (e.g. "May 1977" or "1977-05"): graded.
+    if month_year and cand.show_date and cand.show_year is not None:
+        target_month, target_year = month_year
+        cand_month: Optional[int] = None
+        try:
+            cand_month = int(cand.show_date[5:7])
+        except (ValueError, IndexError):
+            cand_month = None
+        if cand_month is not None:
+            if cand_month == target_month and cand.show_year == target_year:
+                mark(25, f"+25 month/year {target_year}-{target_month:02d}")
+            elif cand.show_year == target_year:
+                mark(10, f"+10 same year {target_year}")
+            elif cand_month == target_month:
+                mark(5, f"+5 same month {target_month:02d}")
 
     # Keyword shortcuts (Cornell, Dick's Picks N, ...)
     for kw, (kdate, kvenue) in KEYWORD_DATES.items():
@@ -300,16 +389,15 @@ def score_candidate(cand: Candidate, query: Optional[str]) -> float:
                 mark(50, f"+50 exact date {d.isoformat()}")
                 break
 
-    # Year-only match
-    yr = parse_year_only(query)
-    if yr and cand.show_year == yr:
-        mark(10, f"+10 year {yr}")
+    # Year-only match (skipped if month/year already scored the year axis).
+    if not month_year:
+        yr = parse_year_only(query)
+        if yr and cand.show_year == yr:
+            mark(10, f"+10 year {yr}")
 
     # Venue substring / token overlap
     if cand.venue:
         venue_l = cand.venue.lower()
-        # Direct substring of significant tokens from query
-        # Tokens are words >= 4 chars not consisting only of digits
         tokens = [
             t for t in re.findall(r"[a-z]+", q)
             if len(t) >= 4 and t not in {"show", "tape", "soundboard", "live", "with", "from"}
@@ -324,8 +412,8 @@ def score_candidate(cand: Candidate, query: Optional[str]) -> float:
         if kw in q and cand.show_year and lo <= cand.show_year <= hi:
             mark(5, f"+5 era '{kw}'")
 
-    # Year-window penalty: out-of-window shows must not outrank the
-    # in-window ones just from a +5 SBD bonus.
+    # Year-window penalty: skipped when a range was provided (range handles
+    # its own filtering).
     target_year = query_target_year(query)
     if target_year and cand.show_year and abs(cand.show_year - target_year) > 1:
         cand.score += YEAR_WINDOW_PENALTY
@@ -776,25 +864,105 @@ def write_manifest(out_dir: Path, entries: list[dict]) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_era(s: Optional[str]) -> Optional[tuple[int, int]]:
+DEFAULT_SOURCES = "SBD,MATRIX"
+
+
+def parse_sources(s: Optional[str]) -> set[str]:
+    """Comma-separated mix-type allowlist -> {'SBD', 'MATRIX', ...} (uppercase)."""
     if not s:
+        return set()
+    return {item.strip().upper() for item in s.split(",") if item.strip()}
+
+
+def candidate_in_sources(cand: Candidate, allowed: set[str]) -> bool:
+    if not allowed:
+        return True
+    q = (cand.quality or "").upper()
+    if not q:
+        # Unknown source type: only let it through if the user explicitly
+        # opened the allowlist with "ANY" or "*".
+        return "ANY" in allowed or "*" in allowed
+    # SBD substring match handles the "SOUNDBOARD"/"SBD"/"SBD>FOB" varieties.
+    return any(a in q or q in a for a in allowed)
+
+
+def derive_year_range(query: Optional[str]) -> Optional[tuple[int, int]]:
+    """Pull a (lo, hi) year window out of a free-form query, for pre-filtering.
+
+    Used to narrow Archive/Relisten searches before the per-candidate
+    scorer takes over. A bare year becomes that year ±1. A range becomes
+    itself. A specific date becomes a 1-year window around it. Era
+    keywords (Brent era etc.) expand to their canonical bounds.
+    """
+    if not query:
         return None
-    m = re.match(r"^\s*(\d{4})\s*-\s*(\d{4})\s*$", s)
-    if not m:
-        raise argparse.ArgumentTypeError(f"--era must look like 1977-1981, got {s!r}")
-    lo, hi = int(m.group(1)), int(m.group(2))
-    if lo > hi:
-        lo, hi = hi, lo
-    return (lo, hi)
+    rng = parse_year_range(query)
+    if rng:
+        return rng
+    # Keyword shortcuts beat dateutil fuzzy parsing: "Brent era" must map to
+    # (1979, 1990), not to today's year via fuzzy-parse.
+    q = query.lower()
+    for kw, (kdate, _venue) in KEYWORD_DATES.items():
+        if kw in q:
+            try:
+                y = int(kdate[:4])
+                return (y, y)
+            except ValueError:
+                pass
+    for kw, span in ERA_KEYWORDS.items():
+        if kw in q:
+            return span
+    my = parse_month_year(query)
+    if my:
+        return (my[1], my[1])
+    yr = parse_year_only(query)
+    if yr:
+        # Bare year: widen by ±1 so Archive search includes adjacent shows
+        # the scorer's ±1 tolerance is willing to consider.
+        return (yr - 1, yr + 1)
+    dates = parse_date_tokens(query)
+    if dates:
+        y = dates[0].year
+        return (y, y)
+    return None
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Auto-download Grateful Dead reference recordings for a song.")
+    p = argparse.ArgumentParser(
+        description="Auto-download Grateful Dead reference recordings for a song."
+    )
     p.add_argument("--song", required=True, help="Song slug or name, e.g. 'peggy-o'")
-    p.add_argument("--count", type=int, default=2, help="How many references to fetch (default 2)")
-    p.add_argument("--era", type=parse_era, help="Year range filter, e.g. 1977-1981")
-    p.add_argument("--query", help='Free-form match text, e.g. "New Haven 1977" or "5/8/77"')
-    p.add_argument("--source", choices=["auto", "relisten", "archive", "youtube"], default="auto")
+    p.add_argument("--count", type=int, default=3,
+                   help="How many references to fetch (default 3)")
+    p.add_argument(
+        "--show",
+        help=(
+            "Specific show (e.g. '5/8/77 Cornell', \"Dick's Picks 25\"). "
+            "When set, fetches multiple distinct mixes of THIS one show."
+        ),
+    )
+    p.add_argument(
+        "--era",
+        help=(
+            "Era / style (e.g. '1977', '1977-1981', 'May 1977', 'Brent era'). "
+            "When set (and --show is empty), fetches different shows that match "
+            "the era. Accepts year, year range, month+year, specific date, "
+            "venue/keyword, or era keyword."
+        ),
+    )
+    # Backwards-compat: --query is a deprecated alias for --era.
+    p.add_argument("--query", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--sources",
+        default=DEFAULT_SOURCES,
+        help=(
+            "Comma-separated allowlist of recording sources (default 'SBD,MATRIX'). "
+            "Examples: 'SBD' for pure soundboards only, 'SBD,AUD,MATRIX' to "
+            "include audience tapes. Pass 'ANY' to accept unlabelled candidates."
+        ),
+    )
+    p.add_argument("--source", choices=["auto", "relisten", "archive", "youtube"], default="auto",
+                   help="Which upstream service to query (default auto cascades).")
     p.add_argument("-v", "--verbose", action="store_true", help="Show each candidate and score")
     p.add_argument("--out", help="Override output directory (defaults to tooling/references/<song_slug>/)")
     p.add_argument(
@@ -803,7 +971,99 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=25,
         help="Give up on a source after this many consecutive download failures (default 25)",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+
+    if args.query and not args.era:
+        log.warning("--query is deprecated; use --era for the same behaviour.")
+        args.era = args.query
+    if args.show and args.era:
+        log.debug("--show is set; --era %r will be ignored.", args.era)
+        args.era = None
+
+    return args
+
+
+def _quality_bucket(cand: Candidate) -> str:
+    """Coarse mix-type bucket for diversification: SBD / MATRIX / AUD / OTHER."""
+    q = (cand.quality or "").upper()
+    if "SBD" in q or "SOUNDBOARD" in q:
+        return "SBD"
+    if "MATRIX" in q:
+        return "MATRIX"
+    if "AUD" in q:
+        return "AUD"
+    return "OTHER"
+
+
+def _show_key(cand: Candidate) -> tuple:
+    """Identity for "the same performance" -- date is the canonical anchor."""
+    return (cand.show_date or "?", _venue_key(cand.venue))
+
+
+def _venue_key(venue: Optional[str]) -> str:
+    if not venue:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", venue.lower()).strip("_")
+
+
+def select_canonical_show(cands: list[Candidate]) -> Optional[tuple[str, Optional[str]]]:
+    """Return the (date, venue) of the highest-scored candidate with a date."""
+    for c in cands:
+        if c.show_date:
+            return (c.show_date, c.venue)
+    return None
+
+
+def diversify_by_quality(cands: list[Candidate], count: int) -> list[Candidate]:
+    """Round-robin pick across SBD / MATRIX / AUD buckets, prefer top-scored within each."""
+    buckets: dict[str, list[Candidate]] = {}
+    for c in cands:
+        buckets.setdefault(_quality_bucket(c), []).append(c)
+    # Bias bucket iteration order: SBD first, then MATRIX, then AUD, then anything else.
+    order = ["SBD", "MATRIX", "AUD"] + [b for b in buckets if b not in {"SBD", "MATRIX", "AUD"}]
+    picked: list[Candidate] = []
+    while len(picked) < count and any(buckets.get(b) for b in order):
+        for b in order:
+            if buckets.get(b):
+                picked.append(buckets[b].pop(0))
+                if len(picked) >= count:
+                    break
+    return picked
+
+
+def dedupe_by_year_month(cands: list[Candidate]) -> list[Candidate]:
+    """Keep at most one candidate per (year, month) for stylistic spread."""
+    seen: set[tuple[int, int]] = set()
+    out: list[Candidate] = []
+    for c in cands:
+        if not c.show_date or len(c.show_date) < 7:
+            out.append(c)
+            continue
+        try:
+            ym = (int(c.show_date[:4]), int(c.show_date[5:7]))
+        except ValueError:
+            out.append(c)
+            continue
+        if ym in seen:
+            continue
+        seen.add(ym)
+        out.append(c)
+    return out
+
+
+def _try_download(cand: Candidate, song: str, song_slug: str,
+                  out_dir: Path, seen_files: set[str], verbose: bool) -> Optional[Path]:
+    fname = candidate_filename(song_slug, cand)
+    if fname in seen_files:
+        log_candidate(cand, verbose, kept=False, note="(dup filename)")
+        return None
+    local_path = download_candidate(cand, song, out_dir)
+    if local_path is None:
+        log_candidate(cand, verbose, kept=False, note="(download failed)")
+        return None
+    seen_files.add(fname)
+    log_candidate(cand, verbose, kept=True)
+    return local_path
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -817,80 +1077,101 @@ def main(argv: Optional[list[str]] = None) -> int:
     out_dir = Path(args.out) if args.out else REFERENCES_ROOT / song_slug
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info("Fetching %d reference(s) for %s -> %s",
-             args.count, song_slug, out_dir)
-    if args.query:
-        log.info("Query: %r", args.query)
+    allowed_sources = parse_sources(args.sources)
 
-    source_buckets = collect_candidates(args.source, args.song, args.query, args.era, args.count)
+    if args.show:
+        mode = "show"
+        match_query = args.show
+    elif args.era:
+        mode = "era"
+        match_query = args.era
+    else:
+        mode = "default"
+        match_query = None
+        log.warning(
+            "Neither --show nor --era given; falling back to 'most popular SBDs' for %s.",
+            song_slug,
+        )
+
+    log.info("Fetching %d reference(s) for %s -> %s [mode=%s]",
+             args.count, song_slug, out_dir, mode)
+    if match_query:
+        log.info("Match query: %r", match_query)
+    log.info("Sources allowlist: %s", sorted(allowed_sources) or "(any)")
+
+    year_range = derive_year_range(match_query)
+    source_buckets = collect_candidates(
+        args.source, args.song, match_query, year_range, args.count
+    )
+
+    # Gather, filter by sources, score, and tag with the source they came from.
+    all_cands: list[Candidate] = []
+    for s, cands in source_buckets.items():
+        kept = [c for c in cands if candidate_in_sources(c, allowed_sources)]
+        if args.verbose:
+            log.info("[%s] %d candidates (%d after --sources filter)",
+                     s, len(cands), len(kept))
+        all_cands.extend(kept)
+
+    ranked = rank(all_cands, match_query)
+
+    if match_query and ranked and not any(c.query_matched for c in ranked):
+        log.error("No good matches for query %r in any source. Aborting.", match_query)
+        return 2
 
     downloaded: list[tuple[Candidate, Path]] = []
     seen_files: set[str] = set()
     manifest_entries: list[dict] = []
 
-    sources_to_try = SOURCE_ORDER if args.source == "auto" else (args.source,)
-    any_query_matches_seen = False
-    for s in sources_to_try:
+    if mode == "show":
+        canonical = select_canonical_show(ranked)
+        if not canonical:
+            log.error("Could not identify a canonical show for query %r.", match_query)
+            return 2
+        target_date, target_venue = canonical
+        log.info("Canonical show: %s @ %s -- pulling up to %d mixes",
+                 target_date, target_venue or "?", args.count)
+        same_show = [c for c in ranked if c.show_date == target_date]
+        picks = diversify_by_quality(same_show, args.count)
+    elif mode == "era":
+        picks = dedupe_by_year_month(ranked)
+    else:
+        picks = ranked
+
+    # Download loop with per-source failure cap.
+    failures_by_source: dict[str, int] = {}
+    for cand in picks:
         if len(downloaded) >= args.count:
             break
-        cands = rank(source_buckets.get(s, []), args.query)
-        if args.verbose:
-            log.info("[%s] %d candidates", s, len(cands))
-
-        # Fail-fast: if a query was given but nothing in this source matched
-        # any of its signals, don't bother trying to download. Move on to
-        # the next source (the global no-matches error fires at the end if
-        # no source produces a match).
-        if args.query and cands and not any(c.query_matched for c in cands):
-            log.warning(
-                "[%s] no good matches for query %r (top score=%.1f); skipping source",
-                s, args.query, cands[0].score,
-            )
+        n_fail = failures_by_source.get(cand.source, 0)
+        if n_fail >= args.max_attempts_per_source:
+            log_candidate(cand, args.verbose, kept=False,
+                          note=f"(source {cand.source} hit failure cap)")
             continue
-        if args.query:
-            any_query_matches_seen = True
-
-        attempts = 0
-        failures = 0
-        for cand in cands:
-            if len(downloaded) >= args.count:
-                break
-            if failures >= args.max_attempts_per_source:
-                log.warning(
-                    "[%s] giving up after %d consecutive failures (--max-attempts-per-source)",
-                    s, failures,
-                )
-                break
-            attempts += 1
-            fname = candidate_filename(song_slug, cand)
-            if fname in seen_files:
-                log_candidate(cand, args.verbose, kept=False, note="(dup filename)")
-                continue
-
-            local_path = download_candidate(cand, args.song, out_dir)
-            if local_path is None:
-                failures += 1
-                log_candidate(cand, args.verbose, kept=False, note="(download failed)")
-                continue
-
-            failures = 0  # reset on success; cap is on *consecutive* failures
-            seen_files.add(fname)
-            downloaded.append((cand, local_path))
-            log_candidate(cand, args.verbose, kept=True)
-
-            manifest_entries.append({
-                "source": cand.source,
-                "show_date": cand.show_date,
-                "venue": cand.venue,
-                "quality": cand.quality,
-                "original_url": cand.url,
-                "filename": local_path.name,
-                "query": args.query,
-                "score": round(cand.score, 2),
-            })
+        local_path = _try_download(cand, args.song, song_slug, out_dir,
+                                   seen_files, args.verbose)
+        if local_path is None:
+            failures_by_source[cand.source] = n_fail + 1
+            continue
+        failures_by_source[cand.source] = 0
+        downloaded.append((cand, local_path))
+        manifest_entries.append({
+            "source": cand.source,
+            "show_date": cand.show_date,
+            "venue": cand.venue,
+            "quality": cand.quality,
+            "original_url": cand.url,
+            "filename": local_path.name,
+            "mode": mode,
+            "show": args.show,
+            "era": args.era,
+            "score": round(cand.score, 2),
+        })
 
     if manifest_entries:
         write_manifest(out_dir, manifest_entries)
+
+    any_query_matches_seen = bool(match_query and any(c.query_matched for c in ranked))
 
     # Summary
     print(f"\nDownloaded {len(downloaded)}/{args.count} references for {song_slug}:")

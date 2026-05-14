@@ -46,15 +46,21 @@ def normalize(word: str) -> str:
 # Transcription
 # ---------------------------------------------------------------------------
 
-def transcribe(audio_path: Path, model_size: str = "base") -> list:
-    """Run faster-whisper. Return [{text, start, end}, ...] (normalized words)."""
+def transcribe(audio_path: Path, model_size: str = "base",
+               vad_filter: bool = False) -> list:
+    """Run faster-whisper. Return [{text, start, end}, ...] (normalized words).
+
+    `vad_filter` defaults to False because the built-in Silero VAD has a
+    habit of dropping sung vocals that are buried in band noise. Set True
+    to re-enable it on speech-heavy material.
+    """
     print(f"  loading whisper model '{model_size}'...", flush=True)
     model = WhisperModel(model_size, compute_type="int8")
-    print(f"  transcribing {audio_path.name}...", flush=True)
+    print(f"  transcribing {audio_path.name} (vad_filter={vad_filter})...", flush=True)
     segments, _ = model.transcribe(
         str(audio_path),
         word_timestamps=True,
-        vad_filter=True,
+        vad_filter=vad_filter,
         language="en",
     )
     words = []
@@ -241,6 +247,9 @@ def main():
     p.add_argument("--transcript", type=Path, default=None,
                    help="Optional pre-computed transcript JSON [{text, start, end}, ...] "
                         "to skip whisper (useful for re-runs or restricted environments)")
+    p.add_argument("--whisper-vad", action="store_true",
+                   help="Enable Silero VAD pre-filtering in whisper. Off by default "
+                        "because VAD drops sung vocals buried in band noise.")
     args = p.parse_args()
 
     template = json.loads(args.template.read_text())
@@ -254,7 +263,7 @@ def main():
                        "end": float(r["end"])} for r in recognized if normalize(r["text"])]
         print(f"  loaded {len(recognized)} words from {args.transcript}")
     else:
-        recognized = transcribe(args.audio, args.model)
+        recognized = transcribe(args.audio, args.model, vad_filter=args.whisper_vad)
     matches = align(recognized, expected)
     matched_n = sum(1 for m in matches if m is not None)
     print(f"matched expected words: {matched_n} / {len(expected)} "

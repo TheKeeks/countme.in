@@ -61,6 +61,8 @@ def _alignment_module():
     return al
 
 
+import inspect_template  # noqa: E402 -- shared report builder
+
 log = logging.getLogger("build_song")
 
 PRIMARY_MODEL = "m-a-p/MERT-v1-95M"
@@ -68,6 +70,10 @@ FALLBACK_MODEL = "facebook/wav2vec2-base"
 EMBED_SAMPLE_RATE = 24000  # MERT-v1-95M expects 24kHz; wav2vec2-base wants 16kHz (we resample below)
 SECTION_SLICE_SEC = 2.0
 EMBED_DECIMALS = 4  # round floats in the JSON to keep file size sane
+
+# Reference is discarded if fewer than this fraction of lyric lines aligned
+# via whisper-matched words (interpolated lines don't count).
+MIN_MATCH_FRAC = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +170,8 @@ def slice_audio(y: np.ndarray, sr: int, start_sec: float, end_sec: float) -> np.
 
 
 def align_reference(audio_path: Path, template: dict, model_size: str,
-                    transcript_path: Optional[Path] = None) -> dict:
+                    transcript_path: Optional[Path] = None,
+                    vad_filter: bool = False) -> dict:
     """Run whisper + fuzzy alignment for one reference. Returns the spans dict."""
     al = _alignment_module()
     expected = al.flatten_lyrics(template)
@@ -177,7 +184,7 @@ def align_reference(audio_path: Path, template: dict, model_size: str,
         ]
         log.info("  loaded %d transcript words from %s", len(recognized), transcript_path.name)
     else:
-        recognized = al.transcribe(audio_path, model_size)
+        recognized = al.transcribe(audio_path, model_size, vad_filter=vad_filter)
     matches = al.align(recognized, expected)
     matched_n = sum(1 for m in matches if m is not None)
     log.info("  matched %d / %d expected words (%.0f%%)",
@@ -192,7 +199,7 @@ def align_reference(audio_path: Path, template: dict, model_size: str,
 # ---------------------------------------------------------------------------
 
 def process_reference(audio_path: Path, template: dict, extractor: EmbeddingExtractor,
-                      model_size: str) -> dict:
+                      model_size: str, vad_filter: bool = False) -> dict:
     """Returns {
         "filename": "...",
         "spans": {(section_id, line_idx): {start_sec, end_sec, ...}, ...},
@@ -201,12 +208,14 @@ def process_reference(audio_path: Path, template: dict, extractor: EmbeddingExtr
     }
     """
     log.info("[%s] aligning ...", audio_path.name)
-    spans = align_reference(audio_path, template, model_size)
+    spans = align_reference(audio_path, template, model_size, vad_filter=vad_filter)
 
     log.info("[%s] extracting embeddings ...", audio_path.name)
     extractor.load()
     y_embed = load_audio_for_embedding(audio_path, extractor.sample_rate)
+    audio_duration = len(y_embed) / extractor.sample_rate if extractor.sample_rate else 0.0
 
+    # Line-level embeddings.
     line_embeddings: dict = {}
     for section in template["structure"]:
         for line in section["lines"]:
@@ -219,9 +228,14 @@ def process_reference(audio_path: Path, template: dict, extractor: EmbeddingExtr
                                       sp["start_sec"], sp["end_sec"])
             line_embeddings[key] = extractor.embed(audio_slice)
 
-    # Section-level embedding sequences. Use the bounds rolled up by alignment.apply
-    # in the single-reference case; here we mirror that logic locally.
-    section_sequences: dict = {}
+    # Section-level embedding sequences. Three passes so every section --
+    # including pure-instrumental intro/jam/outro -- gets a non-empty
+    # sequence (otherwise the live position tracker has nothing to lock
+    # onto during the parts of the song without lyric anchors).
+    sec_ids = [s["section_id"] for s in template["structure"]]
+    bounds: dict[str, tuple[float, float]] = {}
+
+    # Pass 1: bounds from the line spans we got from alignment.
     for section in template["structure"]:
         starts = [spans[(section["section_id"], l["line_index"])]["start_sec"]
                   for l in section["lines"]
@@ -229,11 +243,32 @@ def process_reference(audio_path: Path, template: dict, extractor: EmbeddingExtr
         ends = [spans[(section["section_id"], l["line_index"])]["end_sec"]
                 for l in section["lines"]
                 if (section["section_id"], l["line_index"]) in spans]
-        if not starts or not ends:
-            section_sequences[section["section_id"]] = []
+        if starts and ends:
+            bounds[section["section_id"]] = (max(0.0, min(starts) - 0.5), max(ends) + 0.5)
+
+    # Pass 2: fill remaining sections from neighbours in song order.
+    for i, sid in enumerate(sec_ids):
+        if sid in bounds:
             continue
-        sec_start = max(0.0, min(starts) - 0.5)
-        sec_end = max(ends) + 0.5
+        prev_end: Optional[float] = None
+        for j in range(i - 1, -1, -1):
+            if sec_ids[j] in bounds:
+                prev_end = bounds[sec_ids[j]][1]
+                break
+        next_start: Optional[float] = None
+        for j in range(i + 1, len(sec_ids)):
+            if sec_ids[j] in bounds:
+                next_start = bounds[sec_ids[j]][0]
+                break
+        sec_start = prev_end if prev_end is not None else 0.0
+        sec_end = next_start if next_start is not None else audio_duration
+        bounds[sid] = (sec_start, sec_end)
+
+    # Pass 3: embed every section at SECTION_SLICE_SEC intervals.
+    section_sequences: dict = {}
+    for section in template["structure"]:
+        sid = section["section_id"]
+        sec_start, sec_end = bounds[sid]
         seq = []
         t = sec_start
         while t < sec_end:
@@ -243,7 +278,7 @@ def process_reference(audio_path: Path, template: dict, extractor: EmbeddingExtr
             if emb is not None:
                 seq.append(emb)
             t += SECTION_SLICE_SEC
-        section_sequences[section["section_id"]] = seq
+        section_sequences[sid] = seq
 
     return {
         "filename": audio_path.name,
@@ -319,7 +354,7 @@ def _expand_references(patterns: list[str]) -> list[Path]:
 def assemble_template(lyrics_path: Path, song_id: str, title: str,
                       version_notes: str,
                       references: list[Path], extractor: EmbeddingExtractor,
-                      model_size: str) -> dict:
+                      model_size: str, vad_filter: bool = False) -> dict:
     sections = tb.parse_lyrics(lyrics_path)
     template = asdict(tb.SongTemplate(
         song_id=song_id,
@@ -328,6 +363,8 @@ def assemble_template(lyrics_path: Path, song_id: str, title: str,
         audio_features=None,
         structure=sections,
     ))
+
+    n_lines_total = sum(len(s["lines"]) for s in template["structure"])
 
     # Global audio features from the first reference that loads successfully.
     audio_features = None
@@ -340,19 +377,38 @@ def assemble_template(lyrics_path: Path, song_id: str, title: str,
             log.warning("audio feature extraction failed for %s: %s", ref.name, exc)
     template["audio_features"] = audio_features
 
-    # Process each reference.
+    # Process each reference; gate on alignment quality.
     per_ref_results: list[dict] = []
     for ref in references:
         try:
-            per_ref_results.append(
-                process_reference(ref, template, extractor, model_size)
-            )
+            result = process_reference(ref, template, extractor, model_size,
+                                       vad_filter=vad_filter)
         except Exception as exc:  # noqa: BLE001
             log.warning("reference %s failed (%s); continuing with the rest",
                         ref.name, exc)
+            continue
+
+        matched_lines = sum(
+            1 for sp in result["spans"].values()
+            if not sp.get("interpolated", True) and sp.get("matched_word_count", 0) > 0
+        )
+        if n_lines_total > 0:
+            frac = matched_lines / n_lines_total
+            if frac < MIN_MATCH_FRAC:
+                log.warning(
+                    "[%s] alignment quality too low: %d/%d lines matched (%.0f%%). "
+                    "Discarding this reference.",
+                    ref.name, matched_lines, n_lines_total, 100 * frac,
+                )
+                continue
+        per_ref_results.append(result)
 
     if not per_ref_results:
-        raise RuntimeError("No reference recordings produced usable embeddings.")
+        raise RuntimeError(
+            "All references failed alignment quality check. Try: a larger whisper "
+            "model (--whisper-model small or medium), --vad-filter off, a different "
+            "reference, or supply --transcript with a pre-computed transcript."
+        )
 
     template["references"] = [r["filename"] for r in per_ref_results]
     template["embedding_model"] = extractor.model_name
@@ -360,6 +416,10 @@ def assemble_template(lyrics_path: Path, song_id: str, title: str,
     # Stamp the line-level embeddings and timing back onto the template.
     _populate_lines(template, per_ref_results)
     _populate_sections(template, per_ref_results)
+
+    # Diagnostic report -- same shape as inspect_template prints on a built file.
+    for line in inspect_template.report(template, n_attempted_refs=len(references)).splitlines():
+        log.info(line)
 
     return template
 
@@ -435,6 +495,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--embedding-model", default=None,
                    help=f"HF model id for the encoder (default: {PRIMARY_MODEL}, "
                         f"falls back to {FALLBACK_MODEL})")
+    p.add_argument("--vad", action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable Silero VAD pre-filtering in whisper. Off by default "
+                        "because VAD drops sung vocals buried in band noise. "
+                        "Use --vad to re-enable, --no-vad to be explicit.")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -471,6 +535,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             references=references,
             extractor=extractor,
             model_size=args.whisper_model,
+            vad_filter=args.vad,
         )
     except RuntimeError as exc:
         log.error("%s", exc)

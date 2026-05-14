@@ -1,3 +1,7 @@
 # Auto-downloaded reference recordings — intermediate inputs to the
 # template builder, not artifacts that belong in the repo.
 tooling/references/
+
+# Python bytecode caches.
+__pycache__/
+*.pyc

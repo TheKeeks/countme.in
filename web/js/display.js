@@ -54,7 +54,7 @@ export function renderLyrics(template) {
   }
 }
 
-export function setCurrentLine(sectionId, lineIndex) {
+export function setCurrentLine(sectionId, lineIndex, { immediate = false } = {}) {
   if (sectionId == null) {
     // Reset all to far-future
     renderedLines.forEach(({ el }) => el.dataset.state = 'far-future');
@@ -80,7 +80,7 @@ export function setCurrentLine(sectionId, lineIndex) {
 
   // The viewport is overflow:hidden; we scroll by transforming the stack
   // so the current line sits at the viewport's vertical center.
-  positionStackForCurrent(idx);
+  positionStackForCurrent(idx, immediate);
 }
 
 export function applyFontSize(px) {
@@ -96,7 +96,7 @@ export function applyLookahead(n) {
  * center of the viewport. Uses transform (the viewport is overflow:hidden,
  * so native scrolling is a no-op).
  */
-function positionStackForCurrent(idx) {
+function positionStackForCurrent(idx, immediate = false) {
   const stack = document.getElementById('lyric-stack');
   const viewport = document.getElementById('lyric-viewport');
   if (!stack || !viewport) return;
@@ -118,7 +118,19 @@ function positionStackForCurrent(idx) {
   const m = stack.style.transform.match(/translateY\(([-\d.]+)px\)/);
   const currentTy = m ? parseFloat(m[1]) : 0;
   const newTy = currentTy + delta;
-  stack.style.transform = `translateY(${newTy}px)`;
+
+  if (immediate) {
+    // Suppress the transform transition for this single jump so we don't
+    // animate through every intervening line on an emergency snap.
+    const prev = stack.style.transition;
+    stack.style.transition = 'none';
+    stack.style.transform = `translateY(${newTy}px)`;
+    // Force a reflow so the no-transition style is committed before we restore.
+    void stack.offsetHeight;
+    stack.style.transition = prev;
+  } else {
+    stack.style.transform = `translateY(${newTy}px)`;
+  }
 }
 
 /**

@@ -80,7 +80,7 @@ async function openSong(songId) {
   // The user has to tap the mic button to begin tracking.
   state.tracker = new PositionTracker(template);
   state.tracker.onPositionChange = ({ sectionId, lineIndex, confidence }) => {
-    setCurrentLine(sectionId, lineIndex);
+    setCurrentLine(sectionId, lineIndex, { immediate: state.suppressTrackerJump });
     updateTrackingStatus(state.tracker.state);
   };
   state.audio = new AudioEngine();
@@ -104,9 +104,11 @@ function updateTrackingStatus(s) {
 }
 
 function onEmergencyLineSelected(sectionId, lineIndex) {
-  if (state.tracker) state.tracker.snapTo(sectionId, lineIndex);
-  setCurrentLine(sectionId, lineIndex);
   hideEmergency();
+  state.suppressTrackerJump = true;
+  if (state.tracker) state.tracker.snapTo(sectionId, lineIndex);
+  state.suppressTrackerJump = false;
+  setCurrentLine(sectionId, lineIndex, { immediate: true });
 }
 
 // --- Control panel & emergency overlay -------------------------------

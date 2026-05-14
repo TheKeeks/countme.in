@@ -26,6 +26,12 @@ toward "stay in this section, or move on to the next one", which
 rescues short bursts of confusion between sections that sound alike.
 Disable with `--transition-penalty 0.0`.
 
+Adds an optional VAD pass that adjusts log-emissions before Viterbi:
+when a window has vocals it's penalised against instrumental sections
+(intro / jam / outro), and vice versa. webrtcvad does the per-frame
+speech detection; the script aggregates with a majority vote inside
+each 2 s scoring window. Disable with `--vad-penalty 0.0`.
+
 CLI:
     python tooling/validate_position.py \\
         --template web/templates/peggy_o_aligned.json \\
@@ -296,6 +302,86 @@ def _changed_pct(raw_seq, smoothed_seq) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Voice activity detection
+# ---------------------------------------------------------------------------
+
+VAD_SAMPLE_RATE = 16000   # webrtcvad supports 8 / 16 / 32 / 48 kHz
+VAD_FRAME_MS = 30         # 10 / 20 / 30 only
+VAD_AGGRESSIVENESS = 2    # 0..3, higher = stricter (fewer false positives)
+
+
+def _compute_vad(y: np.ndarray, sr: int, times: list[float],
+                 window_sec: float) -> np.ndarray:
+    """Per-window bool: True iff a majority of webrtcvad frames inside
+    [t, t+window_sec) flagged speech.
+
+    Resamples to 16 kHz int16 PCM in-memory; the input array is left alone.
+    """
+    try:
+        import webrtcvad
+    except ImportError as exc:
+        raise RuntimeError(
+            "webrtcvad is required when --vad-penalty > 0. "
+            "Install with `pip install webrtcvad`, or rerun with --vad-penalty 0.0."
+        ) from exc
+    import librosa
+
+    if sr != VAD_SAMPLE_RATE:
+        y16 = librosa.resample(y, orig_sr=sr, target_sr=VAD_SAMPLE_RATE)
+    else:
+        y16 = y
+    y16_int = (np.clip(y16, -1.0, 1.0) * 32767.0).astype(np.int16)
+
+    frame_samples = int(VAD_SAMPLE_RATE * VAD_FRAME_MS / 1000)  # 480 @ 16k/30ms
+    n_frames = len(y16_int) // frame_samples
+    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+    frame_flags = np.zeros(n_frames, dtype=bool)
+    for i in range(n_frames):
+        s = i * frame_samples
+        frame_bytes = y16_int[s:s + frame_samples].tobytes()
+        try:
+            frame_flags[i] = vad.is_speech(frame_bytes, VAD_SAMPLE_RATE)
+        except Exception:  # noqa: BLE001 -- webrtcvad raises on odd inputs
+            frame_flags[i] = False
+
+    has_vocals = np.zeros(len(times), dtype=bool)
+    for w, t in enumerate(times):
+        f0 = int(t * 1000 // VAD_FRAME_MS)
+        f1 = int((t + window_sec) * 1000 // VAD_FRAME_MS)
+        f0 = max(0, min(f0, n_frames))
+        f1 = max(f0, min(f1, n_frames))
+        if f1 > f0:
+            has_vocals[w] = frame_flags[f0:f1].sum() > (f1 - f0) / 2
+    return has_vocals
+
+
+def _vocal_section_mask(template: dict,
+                        sections: list[tuple[str, str, np.ndarray]]) -> np.ndarray:
+    """True for sections that have at least one lyric line in the template."""
+    lines_count = {
+        s["section_id"]: len(s.get("lines", []) or [])
+        for s in template.get("structure", [])
+    }
+    return np.array(
+        [lines_count.get(sid, 0) > 0 for sid, _stype, _frames in sections],
+        dtype=bool,
+    )
+
+
+def _apply_vad_penalty(log_emissions: np.ndarray,
+                       has_vocals: np.ndarray,
+                       is_vocal_section: np.ndarray,
+                       penalty: float) -> np.ndarray:
+    """Subtract `penalty` from log_emissions[w, s] when the window's vocal
+    state disagrees with the section's vocal-vs-instrumental classification.
+    """
+    if penalty <= 0:
+        return log_emissions
+    mismatch = has_vocals[:, None] != is_vocal_section[None, :]
+    return log_emissions - penalty * mismatch.astype(log_emissions.dtype)
+
+
+# ---------------------------------------------------------------------------
 # Output: CSV
 # ---------------------------------------------------------------------------
 
@@ -325,10 +411,12 @@ def _fmt_mmss(t: float) -> str:
 
 
 def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path,
-             smooth_enabled: bool = False) -> None:
+             smooth_enabled: bool = False,
+             vad_enabled: bool = False) -> None:
     n = len(rows)
     by_section = Counter(r["pred_id"] for r in rows)
     overall_conf = sum(r["conf"] for r in rows) / max(1, n)
+    vocal_pct = (100.0 * sum(1 for r in rows if r["has_vocals"]) / n) if n else 0.0
 
     pair_counts: Counter = Counter()
     for r in rows:
@@ -352,6 +440,10 @@ def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path,
         f"- Window: {WINDOW_SEC}s, hop: {HOP_SEC}s",
         f"- Total windows: {n}",
         f"- Mean confidence: {overall_conf:.3f}",
+    ]
+    if vad_enabled:
+        out.append(f"- VAD: {vocal_pct:.1f}% of windows have vocals")
+    out += [
         "",
         "## Predicted section distribution",
         "",
@@ -426,9 +518,14 @@ def _section_color(i: int, n: int) -> str:
     return f"hsl({hue:.0f}, 70%, 50%)"
 
 
+VAD_VOCAL_COLOR = "#2d2d2d"
+VAD_QUIET_COLOR = "#dddddd"
+
+
 def write_html(rows: list[dict], path: Path, template: dict,
                audio_path: Path, sections: list[tuple[str, str, np.ndarray]],
-               smooth_enabled: bool = False) -> None:
+               smooth_enabled: bool = False,
+               vad_enabled: bool = False) -> None:
     section_ids = [sid for sid, _stype, _frames in sections]
     color_map = {sid: _section_color(i, len(section_ids))
                  for i, sid in enumerate(section_ids)}
@@ -444,29 +541,44 @@ def write_html(rows: list[dict], path: Path, template: dict,
     chart_width = int(total_time * px_per_sec) + 20
     block_w = HOP_SEC * px_per_sec
 
-    # Layout: optional "Raw" / "Smoothed" labels above each strip, then the
-    # block row(s), then the time axis. The single-row chart matches the
-    # pre-smoothing layout byte-for-byte so --transition-penalty 0.0 keeps
-    # output identical.
+    # Stack one strip per enabled output. Single- and two-strip layouts match
+    # the pre-VAD output byte-for-byte so --vad-penalty 0.0 (and additionally
+    # --transition-penalty 0.0) preserves earlier behaviour.
+    strips: list[str] = ["raw"]
     if smooth_enabled:
+        strips.append("smoothed")
+    if vad_enabled:
+        strips.append("vad")
+
+    if len(strips) == 1:
+        # Legacy single-row layout, byte-preserved.
+        strip_h = 48
+        strip_y = [6]
+        label_y: list[Optional[int]] = [None]
+        axis_top = 60
+        tick_text_offset = 18
+        svg_height = 90
+    elif strips == ["raw", "smoothed"]:
+        # Viterbi-only two-row layout from the previous PR, byte-preserved.
+        strip_h = 32
+        strip_y = [20, 80]
+        label_y = [14, 72]
+        axis_top = 116
+        tick_text_offset = 14
+        svg_height = 140
+    else:
+        # General multi-strip layout (raw+vad, raw+smoothed+vad).
         strip_h = 32
         row_gap = 28
-        raw_label_y = 14
-        raw_y = 20
-        smooth_label_y = raw_y + strip_h + row_gap - 8
-        smooth_y = raw_y + strip_h + row_gap
-        axis_top = smooth_y + strip_h + 4
-        chart_height = axis_top + 24
+        strip_y = [20]
+        label_y = [14]
+        for _ in strips[1:]:
+            ny = strip_y[-1] + strip_h + row_gap
+            strip_y.append(ny)
+            label_y.append(ny - 8)
+        axis_top = strip_y[-1] + strip_h + 4
         tick_text_offset = 14
-        svg_height = chart_height
-    else:
-        # Match the pre-smoothing layout byte-for-byte so penalty=0 keeps
-        # the existing output exactly.
-        strip_h = 48
-        raw_y = 6
-        axis_top = raw_y + strip_h + 6  # 60
-        tick_text_offset = 18
-        svg_height = axis_top + 30      # 90
+        svg_height = axis_top + 24
 
     template_name = template.get("song_id") or "?"
     parts: list[str] = [
@@ -503,34 +615,27 @@ def write_html(rows: list[dict], path: Path, template: dict,
             f'{_fmt_mmss(t)}</text>'
         )
 
-    # Raw row.
-    if smooth_enabled:
-        parts.append(
-            f'<text x="10" y="{raw_label_y}" font-size="11" fill="#444" '
-            f'font-weight="600">Raw</text>'
-        )
-    for r in rows:
-        x = r["time"] * px_per_sec + 10
-        color = color_map.get(r["pred_id"], "#999")
-        opacity = max(0.15, min(1.0, r["conf"]))
-        parts.append(
-            f'<rect x="{x:.1f}" y="{raw_y}" width="{block_w:.1f}" '
-            f'height="{strip_h}" fill="{color}" '
-            f'opacity="{opacity:.2f}"/>'
-        )
-
-    # Smoothed row.
-    if smooth_enabled:
-        parts.append(
-            f'<text x="10" y="{smooth_label_y}" font-size="11" fill="#444" '
-            f'font-weight="600">Smoothed</text>'
-        )
+    strip_labels = {"raw": "Raw", "smoothed": "Smoothed", "vad": "VAD"}
+    for kind, sy, ly in zip(strips, strip_y, label_y):
+        if ly is not None:
+            parts.append(
+                f'<text x="10" y="{ly}" font-size="11" fill="#444" '
+                f'font-weight="600">{strip_labels[kind]}</text>'
+            )
         for r in rows:
             x = r["time"] * px_per_sec + 10
-            color = color_map.get(r["smoothed_id"], "#999")
+            if kind == "raw":
+                color = color_map.get(r["pred_id"], "#999")
+                opacity = f'{max(0.15, min(1.0, r["conf"])):.2f}'
+            elif kind == "smoothed":
+                color = color_map.get(r["smoothed_id"], "#999")
+                opacity = "1.00"
+            else:  # vad
+                color = VAD_VOCAL_COLOR if r["has_vocals"] else VAD_QUIET_COLOR
+                opacity = "1.00"
             parts.append(
-                f'<rect x="{x:.1f}" y="{smooth_y}" width="{block_w:.1f}" '
-                f'height="{strip_h}" fill="{color}" opacity="1.00"/>'
+                f'<rect x="{x:.1f}" y="{sy}" width="{block_w:.1f}" '
+                f'height="{strip_h}" fill="{color}" opacity="{opacity}"/>'
             )
 
     parts.append('</svg></div>')
@@ -562,6 +667,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="Viterbi log-penalty for jumps that are not "
                         "stay-in-section or forward-to-next-section. 0.0 "
                         "disables smoothing entirely (default 3.0).")
+    p.add_argument("--vad-penalty", type=float, default=2.0,
+                   help="Log-emission penalty when a window's vocal/no-vocal "
+                        "state (from webrtcvad) disagrees with a section's "
+                        "vocal-vs-instrumental classification. 0.0 disables "
+                        "VAD entirely (default 2.0).")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -624,6 +734,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     log.info("Scored %d windows.", scored)
 
     smooth_enabled = args.transition_penalty > 0.0
+    vad_enabled = args.vad_penalty > 0.0
+
+    has_vocals = np.zeros(scored, dtype=bool)
+    if vad_enabled and scored > 0:
+        log.info("Running VAD ...")
+        has_vocals = _compute_vad(y, EMBED_SR, times, WINDOW_SEC)
+        log.info("VAD: %d/%d windows have vocals (%.1f%%)",
+                 int(has_vocals.sum()), len(has_vocals),
+                 100.0 * has_vocals.mean() if len(has_vocals) else 0.0)
 
     if scored == 0:
         sims_matrix = np.zeros((0, len(sections)), dtype=np.float32)
@@ -634,10 +753,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         raw_idx = sims_matrix.argmax(axis=1).astype(np.int32)
         if smooth_enabled:
             log_em = _log_emissions(sims_matrix)
+            if vad_enabled:
+                is_vocal_section = _vocal_section_mask(template, sections)
+                log_em = _apply_vad_penalty(
+                    log_em, has_vocals, is_vocal_section, args.vad_penalty,
+                )
             log_tr = _transition_log_probs(len(sections), args.transition_penalty)
             smoothed_idx = _viterbi(log_em, log_tr)
-            log.info("Viterbi smoothing on (transition_penalty=%.2f).",
-                     args.transition_penalty)
+            log.info("Viterbi smoothing on (transition_penalty=%.2f%s).",
+                     args.transition_penalty,
+                     f", vad_penalty={args.vad_penalty:.2f}" if vad_enabled else "")
         else:
             smoothed_idx = raw_idx.copy()
 
@@ -660,6 +785,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "top3": top3,
             "smoothed_id": sections[sm_i][0],
             "smoothed_type": sections[sm_i][1],
+            "has_vocals": bool(has_vocals[w]) if w < len(has_vocals) else False,
         })
 
     out_prefix = Path(args.out)
@@ -669,9 +795,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     html_path = out_prefix.with_suffix(".html")
 
     write_csv(rows, csv_path)
-    write_md(rows, md_path, template, args.audio, smooth_enabled=smooth_enabled)
+    write_md(rows, md_path, template, args.audio,
+             smooth_enabled=smooth_enabled, vad_enabled=vad_enabled)
     write_html(rows, html_path, template, args.audio, sections,
-               smooth_enabled=smooth_enabled)
+               smooth_enabled=smooth_enabled, vad_enabled=vad_enabled)
 
     print(f"\nWrote {csv_path}, {md_path.name}, {html_path.name} ({len(rows)} windows)")
     return 0

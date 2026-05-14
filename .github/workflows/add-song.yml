@@ -1,0 +1,122 @@
+name: Add a song
+
+on:
+  workflow_dispatch:
+    inputs:
+      song:
+        description: 'Song slug or name (e.g. peggy-o)'
+        required: true
+        type: string
+      query:
+        description: 'Optional natural-language query (e.g. "5/5/77 New Haven")'
+        required: false
+        type: string
+      count:
+        description: 'Number of references to fetch'
+        required: false
+        type: string
+        default: '2'
+      era:
+        description: 'Year range, e.g. 1977-1981'
+        required: false
+        type: string
+      source:
+        description: 'Which source to pull from'
+        required: false
+        type: choice
+        default: auto
+        options:
+          - auto
+          - relisten
+          - archive
+          - youtube
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    name: Fetch references
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: tooling/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r tooling/requirements.txt
+
+      - name: Fetch references
+        id: fetch
+        env:
+          SONG: ${{ inputs.song }}
+          QUERY: ${{ inputs.query }}
+          COUNT: ${{ inputs.count }}
+          ERA: ${{ inputs.era }}
+          SOURCE: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+          # Build argv as an array so quoting is preserved.
+          args=(--song "$SONG" --count "$COUNT" --source "$SOURCE" -v)
+          if [[ -n "${QUERY:-}" ]]; then
+            args+=(--query "$QUERY")
+          fi
+          if [[ -n "${ERA:-}" ]]; then
+            args+=(--era "$ERA")
+          fi
+
+          # Slug normalisation matches fetch_references.slugify().
+          slug=$(python -c "import re,sys,unicodedata; s=unicodedata.normalize('NFKD',sys.argv[1]).encode('ascii','ignore').decode(); print(re.sub(r'[^a-z0-9]+','_',s.lower()).strip('_'))" "$SONG")
+          echo "song_slug=$slug" >> "$GITHUB_OUTPUT"
+          echo "out_dir=tooling/references/$slug" >> "$GITHUB_OUTPUT"
+
+          python tooling/fetch_references.py "${args[@]}"
+
+      - name: Summarise downloads
+        if: always()
+        env:
+          OUT_DIR: ${{ steps.fetch.outputs.out_dir }}
+          SONG_SLUG: ${{ steps.fetch.outputs.song_slug }}
+        run: |
+          set -euo pipefail
+          manifest="$OUT_DIR/manifest.json"
+          if [[ ! -f "$manifest" ]]; then
+            echo "::error::No manifest.json -- nothing was downloaded for $SONG_SLUG."
+            echo "## Add a song -- $SONG_SLUG" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Nothing was downloaded. See the 'Fetch references' step log for details." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "## Add a song -- $SONG_SLUG"
+            echo ""
+            echo "| source | date | venue | quality | filename |"
+            echo "| --- | --- | --- | --- | --- |"
+            python -c "
+          import json, os, sys
+          path = os.environ['OUT_DIR'] + '/manifest.json'
+          with open(path) as f:
+              entries = json.load(f)
+          for e in entries:
+              print(f\"| {e.get('source','?')} | {e.get('show_date') or '?'} | {e.get('venue') or '?'} | {e.get('quality') or '?'} | {e.get('filename','?')} |\")
+          "
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Downloaded files:"
+          ls -la "$OUT_DIR"
+
+      - name: Upload references artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: references-${{ steps.fetch.outputs.song_slug }}
+          path: ${{ steps.fetch.outputs.out_dir }}
+          if-no-files-found: error
+          retention-days: 14

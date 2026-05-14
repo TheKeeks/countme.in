@@ -32,6 +32,13 @@ when a window has vocals it's penalised against instrumental sections
 speech detection; the script aggregates with a majority vote inside
 each 2 s scoring window. Disable with `--vad-penalty 0.0`.
 
+Adds an optional time prior: at real-time stage use the user knows
+which song is playing and when it started, so the reference timeline
+already tells us which section to expect at each elapsed second. The
+prior adds a bonus to the expected section's log-emission (and a
+smaller bonus to its template-neighbours) before Viterbi runs. Disable
+with `--time-prior-weight 0.0`.
+
 CLI:
     python tooling/validate_position.py \\
         --template web/templates/peggy_o_aligned.json \\
@@ -382,6 +389,100 @@ def _apply_vad_penalty(log_emissions: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Time prior
+# ---------------------------------------------------------------------------
+
+def _section_time_ranges(template: dict,
+                         sections: list[tuple[str, str, np.ndarray]]
+                         ) -> tuple[np.ndarray, np.ndarray]:
+    """(starts, ends) in seconds, parallel to `sections`.
+
+    For sections with timed lyric lines, use the first line's start and the
+    last line's end. Otherwise fall back to whatever section-level start_sec
+    / end_sec the template builder rolled up (build_song now stamps these on
+    every section, including pure-instrumental ones).
+    """
+    section_data = {
+        s["section_id"]: s for s in template.get("structure", [])
+    }
+    starts = np.full(len(sections), np.nan, dtype=np.float64)
+    ends = np.full(len(sections), np.nan, dtype=np.float64)
+    for i, (sid, _stype, _frames) in enumerate(sections):
+        s = section_data.get(sid)
+        if s is None:
+            continue
+        lines = s.get("lines") or []
+        line_starts = [l.get("start_sec") for l in lines
+                       if l.get("start_sec") is not None]
+        line_ends = [l.get("end_sec") for l in lines
+                     if l.get("end_sec") is not None]
+        if line_starts and line_ends:
+            starts[i] = float(min(line_starts))
+            ends[i] = float(max(line_ends))
+            continue
+        if s.get("start_sec") is not None:
+            starts[i] = float(s["start_sec"])
+        if s.get("end_sec") is not None:
+            ends[i] = float(s["end_sec"])
+    return starts, ends
+
+
+def _expected_section_at(t: float,
+                         starts: np.ndarray,
+                         ends: np.ndarray) -> int:
+    """Index of the section whose timed range contains `t`. If no range
+    contains it (gap or out-of-range), fall back to the nearest by midpoint.
+    """
+    n = len(starts)
+    if n == 0:
+        return 0
+    valid_pair = ~(np.isnan(starts) | np.isnan(ends))
+    if valid_pair.any():
+        contains = np.where(valid_pair & (starts <= t) & (t <= ends))[0]
+        if len(contains) > 0:
+            return int(contains[0])
+        mids = (starts + ends) / 2.0
+        diffs = np.abs(mids - t)
+        diffs[~valid_pair] = np.inf
+        return int(np.argmin(diffs))
+    # Degenerate: no section has a usable range. Default to first.
+    return 0
+
+
+def _apply_time_prior(log_emissions: np.ndarray,
+                      times: list[float],
+                      starts: np.ndarray,
+                      ends: np.ndarray,
+                      weight: float) -> tuple[np.ndarray, np.ndarray]:
+    """Add a bonus to the expected section (and a half-bonus to its
+    template-order neighbours) at each window time. Returns the adjusted
+    log-emissions matrix plus the per-window expected-section index array.
+
+    "Adjacent in template order" is approximated here as adjacent in the
+    kept-sections list, which is the same ordering as `template["structure"]`
+    with empty-sequence sections filtered out. For healthy templates the
+    two are identical.
+    """
+    n_windows, n_sections = log_emissions.shape
+    expected = np.zeros(n_windows, dtype=np.int32)
+    if weight <= 0 or n_windows == 0:
+        for w, t in enumerate(times):
+            expected[w] = _expected_section_at(t, starts, ends)
+        return log_emissions, expected
+
+    out = log_emissions.copy()
+    for w, t in enumerate(times):
+        idx = _expected_section_at(t, starts, ends)
+        expected[w] = idx
+        out[w, idx] += weight
+        if idx - 1 >= 0:
+            out[w, idx - 1] += 0.5 * weight
+        if idx + 1 < n_sections:
+            out[w, idx + 1] += 0.5 * weight
+    return out, expected
+
+
+# ---------------------------------------------------------------------------
 # Output: CSV
 # ---------------------------------------------------------------------------
 
@@ -412,7 +513,9 @@ def _fmt_mmss(t: float) -> str:
 
 def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path,
              smooth_enabled: bool = False,
-             vad_enabled: bool = False) -> None:
+             vad_enabled: bool = False,
+             time_prior_enabled: bool = False,
+             time_prior_weight: float = 0.0) -> None:
     n = len(rows)
     by_section = Counter(r["pred_id"] for r in rows)
     overall_conf = sum(r["conf"] for r in rows) / max(1, n)
@@ -443,6 +546,8 @@ def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path,
     ]
     if vad_enabled:
         out.append(f"- VAD: {vocal_pct:.1f}% of windows have vocals")
+    if time_prior_enabled:
+        out.append(f"- Time prior weight: {time_prior_weight:.1f}")
     out += [
         "",
         "## Predicted section distribution",
@@ -505,6 +610,16 @@ def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path,
                 )
                 last_t = r["time"]
 
+    if time_prior_enabled:
+        out += ["", "## Time-prior-only baseline (every 5s)", ""]
+        last_t = -10.0
+        for r in rows:
+            if r["time"] - last_t >= 5.0:
+                out.append(
+                    f"- `{_fmt_mmss(r['time'])}` → **{r['time_prior_id']}**"
+                )
+                last_t = r["time"]
+
     path.write_text("\n".join(out) + "\n")
 
 
@@ -525,7 +640,8 @@ VAD_QUIET_COLOR = "#dddddd"
 def write_html(rows: list[dict], path: Path, template: dict,
                audio_path: Path, sections: list[tuple[str, str, np.ndarray]],
                smooth_enabled: bool = False,
-               vad_enabled: bool = False) -> None:
+               vad_enabled: bool = False,
+               time_prior_enabled: bool = False) -> None:
     section_ids = [sid for sid, _stype, _frames in sections]
     color_map = {sid: _section_color(i, len(section_ids))
                  for i, sid in enumerate(section_ids)}
@@ -545,6 +661,8 @@ def write_html(rows: list[dict], path: Path, template: dict,
     # the pre-VAD output byte-for-byte so --vad-penalty 0.0 (and additionally
     # --transition-penalty 0.0) preserves earlier behaviour.
     strips: list[str] = ["raw"]
+    if time_prior_enabled:
+        strips.append("time_prior")
     if smooth_enabled:
         strips.append("smoothed")
     if vad_enabled:
@@ -615,7 +733,10 @@ def write_html(rows: list[dict], path: Path, template: dict,
             f'{_fmt_mmss(t)}</text>'
         )
 
-    strip_labels = {"raw": "Raw", "smoothed": "Smoothed", "vad": "VAD"}
+    strip_labels = {
+        "raw": "Raw", "smoothed": "Smoothed",
+        "vad": "VAD", "time_prior": "Time prior",
+    }
     for kind, sy, ly in zip(strips, strip_y, label_y):
         if ly is not None:
             parts.append(
@@ -629,6 +750,9 @@ def write_html(rows: list[dict], path: Path, template: dict,
                 opacity = f'{max(0.15, min(1.0, r["conf"])):.2f}'
             elif kind == "smoothed":
                 color = color_map.get(r["smoothed_id"], "#999")
+                opacity = "1.00"
+            elif kind == "time_prior":
+                color = color_map.get(r["time_prior_id"], "#999")
                 opacity = "1.00"
             else:  # vad
                 color = VAD_VOCAL_COLOR if r["has_vocals"] else VAD_QUIET_COLOR
@@ -672,6 +796,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         "state (from webrtcvad) disagrees with a section's "
                         "vocal-vs-instrumental classification. 0.0 disables "
                         "VAD entirely (default 2.0).")
+    p.add_argument("--time-prior-weight", type=float, default=2.0,
+                   help="Bonus added to the log-emission of the section the "
+                        "template's reference timeline says should be playing "
+                        "at this elapsed time (half-bonus to its neighbours). "
+                        "0.0 disables the time prior (default 2.0).")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -735,6 +864,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     smooth_enabled = args.transition_penalty > 0.0
     vad_enabled = args.vad_penalty > 0.0
+    time_prior_enabled = args.time_prior_weight > 0.0
 
     has_vocals = np.zeros(scored, dtype=bool)
     if vad_enabled and scored > 0:
@@ -744,15 +874,32 @@ def main(argv: Optional[list[str]] = None) -> int:
                  int(has_vocals.sum()), len(has_vocals),
                  100.0 * has_vocals.mean() if len(has_vocals) else 0.0)
 
+    # The time prior is computed from the template alone -- no audio
+    # required -- so its expected-section sequence doubles as the
+    # zero-audio baseline the report compares against.
+    starts, ends = _section_time_ranges(template, sections)
+
     if scored == 0:
         sims_matrix = np.zeros((0, len(sections)), dtype=np.float32)
         raw_idx = np.zeros(0, dtype=np.int32)
         smoothed_idx = np.zeros(0, dtype=np.int32)
+        expected_idx = np.zeros(0, dtype=np.int32)
     else:
         sims_matrix = np.stack(sims_rows, axis=0)
         raw_idx = sims_matrix.argmax(axis=1).astype(np.int32)
+        # Always compute expected_idx so the time-prior-only baseline can be
+        # reported even when --time-prior-weight 0.0 (the prior just doesn't
+        # influence Viterbi in that case).
+        expected_idx = np.array(
+            [_expected_section_at(t, starts, ends) for t in times],
+            dtype=np.int32,
+        )
         if smooth_enabled:
             log_em = _log_emissions(sims_matrix)
+            if time_prior_enabled:
+                log_em, _ = _apply_time_prior(
+                    log_em, times, starts, ends, args.time_prior_weight,
+                )
             if vad_enabled:
                 is_vocal_section = _vocal_section_mask(template, sections)
                 log_em = _apply_vad_penalty(
@@ -760,9 +907,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 )
             log_tr = _transition_log_probs(len(sections), args.transition_penalty)
             smoothed_idx = _viterbi(log_em, log_tr)
+            extras = []
+            if vad_enabled:
+                extras.append(f"vad_penalty={args.vad_penalty:.2f}")
+            if time_prior_enabled:
+                extras.append(f"time_prior_weight={args.time_prior_weight:.2f}")
             log.info("Viterbi smoothing on (transition_penalty=%.2f%s).",
                      args.transition_penalty,
-                     f", vad_penalty={args.vad_penalty:.2f}" if vad_enabled else "")
+                     f", {', '.join(extras)}" if extras else "")
         else:
             smoothed_idx = raw_idx.copy()
 
@@ -776,6 +928,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         sm_i = int(smoothed_idx[w])
         confidence = float(sims[raw_i])
         second = float(sims[int(order[1])]) if len(order) > 1 else 0.0
+        tp_i = int(expected_idx[w])
         rows.append({
             "time": times[w],
             "pred_id": sections[raw_i][0],
@@ -786,6 +939,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             "smoothed_id": sections[sm_i][0],
             "smoothed_type": sections[sm_i][1],
             "has_vocals": bool(has_vocals[w]) if w < len(has_vocals) else False,
+            "time_prior_id": sections[tp_i][0],
+            "time_prior_type": sections[tp_i][1],
         })
 
     out_prefix = Path(args.out)
@@ -796,9 +951,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     write_csv(rows, csv_path)
     write_md(rows, md_path, template, args.audio,
-             smooth_enabled=smooth_enabled, vad_enabled=vad_enabled)
+             smooth_enabled=smooth_enabled,
+             vad_enabled=vad_enabled,
+             time_prior_enabled=time_prior_enabled,
+             time_prior_weight=args.time_prior_weight)
     write_html(rows, html_path, template, args.audio, sections,
-               smooth_enabled=smooth_enabled, vad_enabled=vad_enabled)
+               smooth_enabled=smooth_enabled,
+               vad_enabled=vad_enabled,
+               time_prior_enabled=time_prior_enabled)
 
     print(f"\nWrote {csv_path}, {md_path.name}, {html_path.name} ({len(rows)} windows)")
     return 0

@@ -1,0 +1,99 @@
+name: Validate template
+
+on:
+  workflow_dispatch:
+    inputs:
+      template_path:
+        description: 'Path to the template JSON to validate against'
+        required: false
+        type: string
+        default: 'web/templates/peggy_o_aligned.json'
+      audio_url:
+        description: 'Direct download URL for the audio to validate (Dropbox ?dl=0 is auto-flipped to ?dl=1)'
+        required: true
+        type: string
+      song_slug:
+        description: 'Song slug (used to name the output files)'
+        required: false
+        type: string
+        default: 'peggy-o'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Score windows against template
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: tooling/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r tooling/requirements.txt
+
+      - name: Download audio
+        env:
+          AUDIO_URL: ${{ inputs.audio_url }}
+        run: |
+          set -euo pipefail
+          url="$AUDIO_URL"
+          if [[ "$url" == *"dropbox.com"* ]]; then
+            url="${url/?dl=0/?dl=1}"
+            case "$url" in
+              *\?dl=1*) ;;
+              *\?*) url="${url}&dl=1" ;;
+              *) url="${url}?dl=1" ;;
+            esac
+          fi
+          mkdir -p validation
+          echo "Downloading audio from: $url"
+          curl -L --fail --max-time 600 -o validation/band_recording.mp3 "$url"
+          ls -la validation/band_recording.mp3
+
+      - name: Run validate_position
+        env:
+          TEMPLATE: ${{ inputs.template_path }}
+          SLUG: ${{ inputs.song_slug }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$TEMPLATE" ]]; then
+            echo "::error::Template not found: $TEMPLATE"
+            exit 1
+          fi
+          python tooling/validate_position.py \
+            --template "$TEMPLATE" \
+            --audio validation/band_recording.mp3 \
+            --out "validation/${SLUG}_validation" \
+            -v
+          ls -la validation/
+
+      - name: Append markdown report to summary
+        if: always()
+        env:
+          SLUG: ${{ inputs.song_slug }}
+        run: |
+          set -euo pipefail
+          md="validation/${SLUG}_validation.md"
+          if [[ -f "$md" ]]; then
+            cat "$md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-report
+          path: |
+            validation/${{ inputs.song_slug }}_validation.csv
+            validation/${{ inputs.song_slug }}_validation.md
+            validation/${{ inputs.song_slug }}_validation.html
+          if-no-files-found: error
+          retention-days: 30

@@ -30,17 +30,28 @@ on:
           - relisten
           - archive
           - youtube
+      band_recording_url:
+        description: 'Optional URL to a band reference recording (e.g. Dropbox share)'
+        required: false
+        type: string
+      commit_template:
+        description: 'Commit the built template to web/templates/ on success'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   fetch:
-    name: Fetch references
+    name: Fetch + build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -52,6 +63,18 @@ jobs:
       - name: Install dependencies
         run: pip install -r tooling/requirements.txt
 
+      - name: Resolve song slug
+        id: slug
+        env:
+          SONG: ${{ inputs.song }}
+        run: |
+          set -euo pipefail
+          slug=$(python -c "import re,sys,unicodedata; s=unicodedata.normalize('NFKD',sys.argv[1]).encode('ascii','ignore').decode(); print(re.sub(r'[^a-z0-9]+','_',s.lower()).strip('_'))" "$SONG")
+          echo "song_slug=$slug" >> "$GITHUB_OUTPUT"
+          echo "out_dir=tooling/references/$slug" >> "$GITHUB_OUTPUT"
+          echo "lyrics_path=tooling/songs/${slug}.lyrics" >> "$GITHUB_OUTPUT"
+          echo "template_path=web/templates/${slug}_aligned.json" >> "$GITHUB_OUTPUT"
+
       - name: Fetch references
         id: fetch
         env:
@@ -62,7 +85,6 @@ jobs:
           SOURCE: ${{ inputs.source }}
         run: |
           set -euo pipefail
-          # Build argv as an array so quoting is preserved.
           args=(--song "$SONG" --count "$COUNT" --source "$SOURCE" -v)
           if [[ -n "${QUERY:-}" ]]; then
             args+=(--query "$QUERY")
@@ -70,53 +92,125 @@ jobs:
           if [[ -n "${ERA:-}" ]]; then
             args+=(--era "$ERA")
           fi
-
-          # Slug normalisation matches fetch_references.slugify().
-          slug=$(python -c "import re,sys,unicodedata; s=unicodedata.normalize('NFKD',sys.argv[1]).encode('ascii','ignore').decode(); print(re.sub(r'[^a-z0-9]+','_',s.lower()).strip('_'))" "$SONG")
-          echo "song_slug=$slug" >> "$GITHUB_OUTPUT"
-          echo "out_dir=tooling/references/$slug" >> "$GITHUB_OUTPUT"
-
           python tooling/fetch_references.py "${args[@]}"
 
-      - name: Summarise downloads
-        if: always()
+      - name: Download band recording
+        if: ${{ inputs.band_recording_url != '' }}
         env:
-          OUT_DIR: ${{ steps.fetch.outputs.out_dir }}
-          SONG_SLUG: ${{ steps.fetch.outputs.song_slug }}
+          BAND_URL: ${{ inputs.band_recording_url }}
+          OUT_DIR: ${{ steps.slug.outputs.out_dir }}
         run: |
           set -euo pipefail
-          manifest="$OUT_DIR/manifest.json"
-          if [[ ! -f "$manifest" ]]; then
-            echo "::error::No manifest.json -- nothing was downloaded for $SONG_SLUG."
-            echo "## Add a song -- $SONG_SLUG" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Nothing was downloaded. See the 'Fetch references' step log for details." >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p "$OUT_DIR"
+          # Dropbox share URLs serve a preview page on ?dl=0; flip to ?dl=1.
+          url="$BAND_URL"
+          if [[ "$url" == *"dropbox.com"* ]]; then
+            url="${url/?dl=0/?dl=1}"
+            case "$url" in
+              *\?dl=1*) ;;
+              *\?*) url="${url}&dl=1" ;;
+              *) url="${url}?dl=1" ;;
+            esac
+          fi
+          dest="$OUT_DIR/band_recording.mp3"
+          echo "Downloading band recording from: $url"
+          curl -L --fail --max-time 600 -o "$dest" "$url"
+          ls -la "$dest"
+
+      - name: Summarise downloads
+        env:
+          OUT_DIR: ${{ steps.slug.outputs.out_dir }}
+          SONG_SLUG: ${{ steps.slug.outputs.song_slug }}
+        run: |
+          set -euo pipefail
+          if [[ ! -d "$OUT_DIR" ]] || [[ -z "$(ls -A "$OUT_DIR" 2>/dev/null)" ]]; then
+            echo "::error::No references in $OUT_DIR"
             exit 1
           fi
 
           {
             echo "## Add a song -- $SONG_SLUG"
             echo ""
-            echo "| source | date | venue | quality | filename |"
-            echo "| --- | --- | --- | --- | --- |"
-            python -c "
-          import json, os, sys
-          path = os.environ['OUT_DIR'] + '/manifest.json'
-          with open(path) as f:
-              entries = json.load(f)
-          for e in entries:
-              print(f\"| {e.get('source','?')} | {e.get('show_date') or '?'} | {e.get('venue') or '?'} | {e.get('quality') or '?'} | {e.get('filename','?')} |\")
-          "
+            echo "### References"
+            echo ""
+            ls -1 "$OUT_DIR"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "Downloaded files:"
+          echo "Files in $OUT_DIR:"
           ls -la "$OUT_DIR"
 
       - name: Upload references artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: references-${{ steps.fetch.outputs.song_slug }}
-          path: ${{ steps.fetch.outputs.out_dir }}
-          if-no-files-found: error
+          name: references-${{ steps.slug.outputs.song_slug }}
+          path: ${{ steps.slug.outputs.out_dir }}
+          if-no-files-found: warn
           retention-days: 14
+
+      - name: Check lyrics file
+        id: lyrics
+        env:
+          LYRICS_PATH: ${{ steps.slug.outputs.lyrics_path }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$LYRICS_PATH" ]]; then
+            echo "::warning::Lyrics file $LYRICS_PATH not found -- skipping template build."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build song template
+        id: build
+        if: ${{ steps.lyrics.outputs.found == 'true' }}
+        env:
+          SONG_SLUG: ${{ steps.slug.outputs.song_slug }}
+          OUT_DIR: ${{ steps.slug.outputs.out_dir }}
+          LYRICS_PATH: ${{ steps.slug.outputs.lyrics_path }}
+          TEMPLATE_PATH: ${{ steps.slug.outputs.template_path }}
+        run: |
+          set -euo pipefail
+          python tooling/build_song.py \
+            --song "$SONG_SLUG" \
+            --references "$OUT_DIR/*.mp3" \
+            --lyrics "$LYRICS_PATH" \
+            --out "$TEMPLATE_PATH" \
+            -v
+
+      - name: Upload template artifact
+        if: ${{ steps.build.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: template-${{ steps.slug.outputs.song_slug }}
+          path: ${{ steps.slug.outputs.template_path }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Commit template to repo
+        if: ${{ steps.build.outcome == 'success' && inputs.commit_template }}
+        env:
+          TEMPLATE_PATH: ${{ steps.slug.outputs.template_path }}
+          SONG_SLUG: ${{ steps.slug.outputs.song_slug }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Bail if nothing to commit (idempotent re-runs).
+          if git diff --quiet -- "$TEMPLATE_PATH"; then
+            if ! git ls-files --error-unmatch "$TEMPLATE_PATH" >/dev/null 2>&1; then
+              git add "$TEMPLATE_PATH"
+            fi
+          else
+            git add "$TEMPLATE_PATH"
+          fi
+          if git diff --cached --quiet; then
+            echo "No template changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Add/update template for ${SONG_SLUG}
+
+          Generated by .github/workflows/add-song.yml on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+          git push origin "HEAD:${GITHUB_REF#refs/heads/}"

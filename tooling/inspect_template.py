@@ -175,7 +175,7 @@ def report(template: dict, n_attempted_refs: Optional[int] = None) -> str:
 
 def section_table(template: dict) -> str:
     """Per-section breakdown table."""
-    headers = ["section_id", "type", "start_sec", "end_sec",
+    headers = ["section_id", "type", "start_time", "end_time", "duration",
                "n_lines", "n_frames", "n_unique_timings"]
     rows: list[list[str]] = [headers]
     for section in template.get("structure", []):
@@ -186,11 +186,20 @@ def section_table(template: dict) -> str:
             for l in lines
             if l.get("start_sec") is not None or l.get("end_sec") is not None
         }
+        st = section.get("start_time")
+        et = section.get("end_time")
+        dur = None
+        if st is not None and et is not None:
+            try:
+                dur = float(et) - float(st)
+            except (TypeError, ValueError):
+                dur = None
         rows.append([
             str(section.get("section_id", "")),
             str(section.get("section_type", "")),
-            _fmt_sec(section.get("start_sec")),
-            _fmt_sec(section.get("end_sec")),
+            _fmt_sec(st),
+            _fmt_sec(et),
+            _fmt_sec(dur),
             str(len(lines)),
             str(len(seq)),
             str(len(unique)),

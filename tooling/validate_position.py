@@ -397,10 +397,10 @@ def _section_time_ranges(template: dict,
                          ) -> tuple[np.ndarray, np.ndarray]:
     """(starts, ends) in seconds, parallel to `sections`.
 
-    For sections with timed lyric lines, use the first line's start and the
-    last line's end. Otherwise fall back to whatever section-level start_sec
-    / end_sec the template builder rolled up (build_song now stamps these on
-    every section, including pure-instrumental ones).
+    Reads the explicit `start_time` / `end_time` fields build_song stamps on
+    every section (including pure-instrumental ones). Falls back to the
+    legacy fields and to line bounds for backward compatibility with
+    templates built before those fields existed.
     """
     section_data = {
         s["section_id"]: s for s in template.get("structure", [])
@@ -411,6 +411,11 @@ def _section_time_ranges(template: dict,
         s = section_data.get(sid)
         if s is None:
             continue
+        if s.get("start_time") is not None and s.get("end_time") is not None:
+            starts[i] = float(s["start_time"])
+            ends[i] = float(s["end_time"])
+            continue
+        # Backward-compat fallback for templates predating start_time/end_time.
         lines = s.get("lines") or []
         line_starts = [l.get("start_sec") for l in lines
                        if l.get("start_sec") is not None]
@@ -430,15 +435,16 @@ def _section_time_ranges(template: dict,
 def _expected_section_at(t: float,
                          starts: np.ndarray,
                          ends: np.ndarray) -> int:
-    """Index of the section whose timed range contains `t`. If no range
-    contains it (gap or out-of-range), fall back to the nearest by midpoint.
+    """Index of the section whose half-open [start_time, end_time) range
+    contains `t`. If no range contains it (gap or out-of-range), fall back
+    to the section whose midpoint is closest to `t`.
     """
     n = len(starts)
     if n == 0:
         return 0
     valid_pair = ~(np.isnan(starts) | np.isnan(ends))
     if valid_pair.any():
-        contains = np.where(valid_pair & (starts <= t) & (t <= ends))[0]
+        contains = np.where(valid_pair & (starts <= t) & (t < ends))[0]
         if len(contains) > 0:
             return int(contains[0])
         mids = (starts + ends) / 2.0

@@ -454,32 +454,46 @@ def _expected_section_at(t: float,
     return 0
 
 
-def _apply_time_prior(log_emissions: np.ndarray,
-                      times: list[float],
+def _expected_indices(times: list[float],
                       starts: np.ndarray,
                       ends: np.ndarray,
-                      weight: float) -> tuple[np.ndarray, np.ndarray]:
-    """Add a bonus to the expected section at each window time. Returns the
-    adjusted log-emissions matrix plus the per-window expected-section index
-    array.
+                      window_sec: float,
+                      song_offset: float = 0.0) -> np.ndarray:
+    """Per-window expected-section index, computed at the window's centre.
+
+    The window centre minus `song_offset` becomes the effective time used
+    against the template's section ranges. Windows whose effective time is
+    negative (pre-song content -- band tuning, chatter, etc.) get index -1
+    so the time prior contributes nothing for them.
+    """
+    n = len(times)
+    out = np.full(n, -1, dtype=np.int32)
+    for w, t in enumerate(times):
+        eff = t + window_sec / 2.0 - song_offset
+        if eff < 0:
+            continue
+        out[w] = _expected_section_at(eff, starts, ends)
+    return out
+
+
+def _apply_time_prior(log_emissions: np.ndarray,
+                      expected_idx: np.ndarray,
+                      weight: float) -> np.ndarray:
+    """Add a bonus to the expected section at each window time.
 
     Only the expected section receives the bonus -- spreading half to the
     neighbours nullified the prior at section transitions (previous state +
     expected both got bonuses, so the smoother couldn't tell them apart).
+    Windows with expected_idx == -1 (pre-song, before `song_offset`) get no
+    bonus on any section.
     """
-    n_windows, _n_sections = log_emissions.shape
-    expected = np.zeros(n_windows, dtype=np.int32)
-    if weight <= 0 or n_windows == 0:
-        for w, t in enumerate(times):
-            expected[w] = _expected_section_at(t, starts, ends)
-        return log_emissions, expected
-
+    if weight <= 0 or len(expected_idx) == 0:
+        return log_emissions
     out = log_emissions.copy()
-    for w, t in enumerate(times):
-        idx = _expected_section_at(t, starts, ends)
-        expected[w] = idx
-        out[w, idx] += weight
-    return out, expected
+    for w, idx in enumerate(expected_idx):
+        if idx >= 0:
+            out[w, int(idx)] += weight
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +649,7 @@ def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path,
              vad_enabled: bool = False,
              time_prior_enabled: bool = False,
              time_prior_weight: float = 0.0,
+             song_offset: float = 0.0,
              gt_enabled: bool = False) -> None:
     n = len(rows)
     by_section = Counter(r["pred_id"] for r in rows)
@@ -668,6 +683,11 @@ def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path,
         out.append(f"- VAD: {vocal_pct:.1f}% of windows have vocals")
     if time_prior_enabled:
         out.append(f"- Time prior weight: {time_prior_weight:.1f}")
+    if song_offset:
+        out.append(
+            f"- Song offset: {song_offset:.1f}s "
+            f"(pre-song audio before time prior anchor)"
+        )
 
     if gt_enabled:
         out += [""] + _accuracy_md_block(rows)
@@ -739,8 +759,10 @@ def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path,
         last_t = -10.0
         for r in rows:
             if r["time"] - last_t >= 5.0:
+                tp = r["time_prior_id"]
+                label = f"**{tp}**" if tp is not None else "_(pre-song)_"
                 out.append(
-                    f"- `{_fmt_mmss(r['time'])}` → **{r['time_prior_id']}**"
+                    f"- `{_fmt_mmss(r['time'])}` → {label}"
                 )
                 last_t = r["time"]
 
@@ -881,7 +903,11 @@ def write_html(rows: list[dict], path: Path, template: dict,
                 color = color_map.get(r["smoothed_id"], "#999")
                 opacity = "1.00"
             elif kind == "time_prior":
-                color = color_map.get(r["time_prior_id"], "#999")
+                tp = r["time_prior_id"]
+                if tp is None:
+                    color = "#eeeeee"  # pre-song window (before song_offset)
+                else:
+                    color = color_map.get(tp, "#999")
                 opacity = "1.00"
             elif kind == "ground_truth":
                 gt = r.get("gt_section_id")
@@ -937,6 +963,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         "template's reference timeline says should be playing "
                         "at this elapsed time. 0.0 disables the time prior "
                         "(default 2.0).")
+    p.add_argument("--song-offset", type=float, default=0.0,
+                   help="Seconds of pre-song content in the audio. Subtracted "
+                        "from each window's centre timestamp before the time "
+                        "prior looks up the expected section. MERT scoring, "
+                        "ground-truth lookup, and report timestamps are "
+                        "unaffected. Windows whose effective time is "
+                        "negative (before song start) get no time-prior bonus "
+                        "(default 0.0).")
     p.add_argument("--ground-truth", type=Path, default=None,
                    help="Optional path to a tooling/ground_truth/<song>.json file. "
                         "When set, the report includes accuracy numbers against "
@@ -1037,16 +1071,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         raw_idx = sims_matrix.argmax(axis=1).astype(np.int32)
         # Always compute expected_idx so the time-prior-only baseline can be
         # reported even when --time-prior-weight 0.0 (the prior just doesn't
-        # influence Viterbi in that case).
-        expected_idx = np.array(
-            [_expected_section_at(t, starts, ends) for t in times],
-            dtype=np.int32,
+        # influence Viterbi in that case). Pre-song windows (effective time
+        # before song start under --song-offset) get -1 and contribute nothing.
+        expected_idx = _expected_indices(
+            times, starts, ends, WINDOW_SEC, song_offset=args.song_offset,
         )
         if smooth_enabled:
             log_em = _log_emissions(sims_matrix)
             if time_prior_enabled:
-                log_em, _ = _apply_time_prior(
-                    log_em, times, starts, ends, args.time_prior_weight,
+                log_em = _apply_time_prior(
+                    log_em, expected_idx, args.time_prior_weight,
                 )
             if vad_enabled:
                 is_vocal_section = _vocal_section_mask(template, sections)
@@ -1077,6 +1111,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         confidence = float(sims[raw_i])
         second = float(sims[int(order[1])]) if len(order) > 1 else 0.0
         tp_i = int(expected_idx[w])
+        if tp_i >= 0:
+            tp_id = sections[tp_i][0]
+            tp_type = sections[tp_i][1]
+        else:
+            # Pre-song window (effective time before song_offset).
+            tp_id = None
+            tp_type = None
         gt_sid = None
         if gt_enabled:
             gt_sid = gt_section_at(times[w] + WINDOW_SEC / 2, gt_intervals)
@@ -1090,8 +1131,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             "smoothed_id": sections[sm_i][0],
             "smoothed_type": sections[sm_i][1],
             "has_vocals": bool(has_vocals[w]) if w < len(has_vocals) else False,
-            "time_prior_id": sections[tp_i][0],
-            "time_prior_type": sections[tp_i][1],
+            "time_prior_id": tp_id,
+            "time_prior_type": tp_type,
             "gt_section_id": gt_sid,
         })
 
@@ -1107,6 +1148,7 @@ def main(argv: Optional[list[str]] = None) -> int:
              vad_enabled=vad_enabled,
              time_prior_enabled=time_prior_enabled,
              time_prior_weight=args.time_prior_weight,
+             song_offset=args.song_offset,
              gt_enabled=gt_enabled)
     write_html(rows, html_path, template, args.audio, sections,
                smooth_enabled=smooth_enabled,

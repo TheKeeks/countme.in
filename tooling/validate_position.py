@@ -35,9 +35,8 @@ each 2 s scoring window. Disable with `--vad-penalty 0.0`.
 Adds an optional time prior: at real-time stage use the user knows
 which song is playing and when it started, so the reference timeline
 already tells us which section to expect at each elapsed second. The
-prior adds a bonus to the expected section's log-emission (and a
-smaller bonus to its template-neighbours) before Viterbi runs. Disable
-with `--time-prior-weight 0.0`.
+prior adds a bonus to the expected section's log-emission before
+Viterbi runs. Disable with `--time-prior-weight 0.0`.
 
 CLI:
     python tooling/validate_position.py \\
@@ -460,16 +459,15 @@ def _apply_time_prior(log_emissions: np.ndarray,
                       starts: np.ndarray,
                       ends: np.ndarray,
                       weight: float) -> tuple[np.ndarray, np.ndarray]:
-    """Add a bonus to the expected section (and a half-bonus to its
-    template-order neighbours) at each window time. Returns the adjusted
-    log-emissions matrix plus the per-window expected-section index array.
+    """Add a bonus to the expected section at each window time. Returns the
+    adjusted log-emissions matrix plus the per-window expected-section index
+    array.
 
-    "Adjacent in template order" is approximated here as adjacent in the
-    kept-sections list, which is the same ordering as `template["structure"]`
-    with empty-sequence sections filtered out. For healthy templates the
-    two are identical.
+    Only the expected section receives the bonus -- spreading half to the
+    neighbours nullified the prior at section transitions (previous state +
+    expected both got bonuses, so the smoother couldn't tell them apart).
     """
-    n_windows, n_sections = log_emissions.shape
+    n_windows, _n_sections = log_emissions.shape
     expected = np.zeros(n_windows, dtype=np.int32)
     if weight <= 0 or n_windows == 0:
         for w, t in enumerate(times):
@@ -481,10 +479,6 @@ def _apply_time_prior(log_emissions: np.ndarray,
         idx = _expected_section_at(t, starts, ends)
         expected[w] = idx
         out[w, idx] += weight
-        if idx - 1 >= 0:
-            out[w, idx - 1] += 0.5 * weight
-        if idx + 1 < n_sections:
-            out[w, idx + 1] += 0.5 * weight
     return out, expected
 
 
@@ -941,8 +935,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--time-prior-weight", type=float, default=2.0,
                    help="Bonus added to the log-emission of the section the "
                         "template's reference timeline says should be playing "
-                        "at this elapsed time (half-bonus to its neighbours). "
-                        "0.0 disables the time prior (default 2.0).")
+                        "at this elapsed time. 0.0 disables the time prior "
+                        "(default 2.0).")
     p.add_argument("--ground-truth", type=Path, default=None,
                    help="Optional path to a tooling/ground_truth/<song>.json file. "
                         "When set, the report includes accuracy numbers against "

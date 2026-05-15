@@ -1,0 +1,21 @@
+{
+  "song_id": "peggy_o",
+  "audio_source": "gd78-05-10d1t107",
+  "audio_url": "https://archive.org/details/gd78-05-10.sbd.lai.3899.sbefail.shnf/gd78-05-10d1t107.shn",
+  "labeled_by": "manual",
+  "notes": "Section boundaries manually identified by listening. Approximate to nearest ~1s. Section IDs starting with underscore are excluded from accuracy calculation.",
+  "sections": [
+    {"section_id": "intro_1",  "start": 0,   "end": 53,  "lyric_cue": null},
+    {"section_id": "verse_1",  "start": 53,  "end": 85,  "lyric_cue": "as we rode out"},
+    {"section_id": "verse_2",  "start": 85,  "end": 117, "lyric_cue": "will you marry me"},
+    {"section_id": "verse_3",  "start": 117, "end": 148, "lyric_cue": "I would marry you"},
+    {"section_id": "verse_4",  "start": 148, "end": 181, "lyric_cue": "what would your mama think"},
+    {"section_id": "jam_1",    "start": 181, "end": 311, "lyric_cue": null, "notes": "Jerry solo"},
+    {"section_id": "verse_5",  "start": 311, "end": 350, "lyric_cue": "if ever I return", "notes": "verse_5 vamps an extra ~5s at the end; verse_6 should have started on beat 1 at ~5:45 but band took extra measures to gather lyrics. Not typical, not what our band does."},
+    {"section_id": "verse_6",  "start": 350, "end": 382, "lyric_cue": "come steppin down the stairs", "notes": "delayed entry by ~5s vs typical structure (see verse_5 notes)"},
+    {"section_id": "verse_7",  "start": 382, "end": 415, "lyric_cue": "sweet william he is dead"},
+    {"section_id": "verse_8",  "start": 415, "end": 444, "lyric_cue": "as we rode out (verse 1 reprise)"},
+    {"section_id": "outro_1",  "start": 444, "end": 455, "lyric_cue": null, "notes": "outro walkdown"},
+    {"section_id": "_silence", "start": 455, "end": 464, "lyric_cue": null, "notes": "crowd noise only, no music"}
+  ]
+}

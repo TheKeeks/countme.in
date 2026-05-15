@@ -1,0 +1,123 @@
+name: Detect first verse
+
+on:
+  workflow_dispatch:
+    inputs:
+      audio_url:
+        description: 'Direct download URL for audio (Dropbox ?dl=0 auto-flipped to ?dl=1)'
+        required: true
+        type: string
+      search_text:
+        description: 'Lyric phrase to find (default: opening of Peggy-O)'
+        required: false
+        type: string
+        default: 'as we rode out'
+      tap_time:
+        description: 'Earliest audio time after which to search, in seconds'
+        required: false
+        type: number
+        default: 0.0
+      ground_truth_time:
+        description: 'Optional known verse_1 start time, in seconds, for error reporting'
+        required: false
+        type: number
+      whisper_model:
+        description: 'Whisper model size'
+        required: false
+        type: choice
+        default: base
+        options:
+          - tiny
+          - base
+          - small
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Run Whisper first-verse probe
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Python deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # faster-whisper preferred; openai-whisper is the fallback the
+          # script knows how to use if this install ever fails.
+          pip install "faster-whisper>=1.0" "librosa>=0.10" "rapidfuzz>=3.0"
+
+      - name: Download audio
+        env:
+          AUDIO_URL: ${{ inputs.audio_url }}
+        run: |
+          set -euo pipefail
+          url="$AUDIO_URL"
+          if [[ "$url" == *"dropbox.com"* ]]; then
+            url="${url/?dl=0/?dl=1}"
+            case "$url" in
+              *\?dl=1*) ;;
+              *\?*) url="${url}&dl=1" ;;
+              *) url="${url}?dl=1" ;;
+            esac
+          fi
+          mkdir -p detect
+          echo "Downloading audio from: $url"
+          # No extension on purpose: detect_first_verse re-encodes via ffmpeg.
+          curl -L --fail --max-time 600 -o detect/audio "$url"
+          ls -la detect/audio
+
+      - name: Run first-verse detector
+        env:
+          SEARCH_TEXT: ${{ inputs.search_text }}
+          TAP_TIME: ${{ inputs.tap_time }}
+          GT_TIME: ${{ inputs.ground_truth_time }}
+          WHISPER_MODEL: ${{ inputs.whisper_model }}
+        run: |
+          set -euo pipefail
+          args=(--audio detect/audio --search-text "$SEARCH_TEXT" \
+                --tap-time "$TAP_TIME" --model "$WHISPER_MODEL" \
+                --output detect/report.json)
+          if [[ -n "${GT_TIME:-}" ]]; then
+            args+=(--ground-truth-time "$GT_TIME")
+          fi
+          python tooling/detect_first_verse.py "${args[@]}" | tee detect/stdout.txt
+
+      - name: Append stdout to job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f detect/stdout.txt ]]; then
+            {
+              echo '## Detect first verse'
+              echo ''
+              echo '```'
+              cat detect/stdout.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: detect-first-verse-report
+          path: |
+            detect/report.json
+            detect/stdout.txt
+          if-no-files-found: warn
+          retention-days: 30

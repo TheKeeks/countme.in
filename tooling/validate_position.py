@@ -489,6 +489,42 @@ def _apply_time_prior(log_emissions: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Ground truth
+# ---------------------------------------------------------------------------
+
+def load_ground_truth(path: Path) -> list[tuple[str, float, float]]:
+    """Return [(section_id, start, end), ...] from a GT JSON file.
+
+    The schema is the same one build_song.py reads:
+        {"sections": [{"section_id": str, "start": num, "end": num, ...}, ...]}
+    Section IDs starting with `_` (e.g. `_silence`) are kept in the list and
+    later excluded from accuracy stats by the caller.
+    """
+    data = json.loads(path.read_text())
+    out: list[tuple[str, float, float]] = []
+    for s in data.get("sections", []):
+        if "section_id" in s and "start" in s and "end" in s:
+            out.append((s["section_id"], float(s["start"]), float(s["end"])))
+    return out
+
+
+def gt_section_at(t: float,
+                  gt: list[tuple[str, float, float]]) -> Optional[str]:
+    """Return the GT section_id whose half-open [start, end) contains t.
+
+    Returns None when no interval matches (e.g. t past the labelled audio).
+    """
+    for sid, gs, ge in gt:
+        if gs <= t < ge:
+            return sid
+    return None
+
+
+def _is_excluded(section_id: Optional[str]) -> bool:
+    return section_id is None or section_id.startswith("_")
+
+
+# ---------------------------------------------------------------------------
 # Output: CSV
 # ---------------------------------------------------------------------------
 
@@ -517,11 +553,95 @@ def _fmt_mmss(t: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def _accuracy_md_block(rows: list[dict]) -> list[str]:
+    """Compute and format the 'Accuracy vs ground truth' section."""
+    # Windows with a GT section (and not an excluded `_*` section).
+    scored = [r for r in rows if not _is_excluded(r.get("gt_section_id"))]
+    excluded = len(rows) - len(scored)
+    n = len(scored)
+
+    def _accuracy(field: str) -> float:
+        if not scored:
+            return 0.0
+        return 100.0 * sum(1 for r in scored if r[field] == r["gt_section_id"]) / n
+
+    raw_acc = _accuracy("pred_id")
+    smooth_acc = _accuracy("smoothed_id")
+    tp_acc = _accuracy("time_prior_id")
+
+    # Per-section accuracy.
+    per_section: dict[str, dict[str, int]] = {}
+    for r in scored:
+        sid = r["gt_section_id"]
+        bucket = per_section.setdefault(sid, {"total": 0, "raw": 0, "smoothed": 0, "tp": 0})
+        bucket["total"] += 1
+        if r["pred_id"] == sid:
+            bucket["raw"] += 1
+        if r["smoothed_id"] == sid:
+            bucket["smoothed"] += 1
+        if r["time_prior_id"] == sid:
+            bucket["tp"] += 1
+
+    # Top confusions for raw and smoothed (true_gt != predicted).
+    raw_conf: Counter = Counter()
+    smooth_conf: Counter = Counter()
+    for r in scored:
+        gt = r["gt_section_id"]
+        if r["pred_id"] != gt:
+            raw_conf[(gt, r["pred_id"])] += 1
+        if r["smoothed_id"] != gt:
+            smooth_conf[(gt, r["smoothed_id"])] += 1
+
+    out: list[str] = [
+        "## Accuracy vs ground truth",
+        "",
+        f"- Raw (MERT argmax): {raw_acc:.1f}%",
+        f"- Smoothed (Viterbi fusion): {smooth_acc:.1f}%",
+        f"- Time-prior-only baseline: {tp_acc:.1f}%",
+        f"- Excluded windows: {excluded}",
+        "",
+        "### Per-section accuracy",
+        "",
+        "| section_id | raw % | smoothed % | time-prior % |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    # Sort by first time the section appears in GT for stable display.
+    section_order: list[str] = []
+    for r in scored:
+        if r["gt_section_id"] not in section_order:
+            section_order.append(r["gt_section_id"])
+    for sid in section_order:
+        b = per_section[sid]
+        tot = b["total"]
+        out.append(
+            f"| `{sid}` | {100*b['raw']/tot:.1f}% | "
+            f"{100*b['smoothed']/tot:.1f}% | "
+            f"{100*b['tp']/tot:.1f}% |"
+        )
+
+    out += ["", "### Top confusions", ""]
+    out.append("**Raw** (true → predicted: N windows)")
+    if raw_conf:
+        for (gt, pred), c in raw_conf.most_common(5):
+            out.append(f"- `{gt}` → `{pred}`: {c} windows")
+    else:
+        out.append("- _none_")
+    out.append("")
+    out.append("**Smoothed** (true → predicted: N windows)")
+    if smooth_conf:
+        for (gt, pred), c in smooth_conf.most_common(5):
+            out.append(f"- `{gt}` → `{pred}`: {c} windows")
+    else:
+        out.append("- _none_")
+    return out
+
+
 def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path,
              smooth_enabled: bool = False,
              vad_enabled: bool = False,
              time_prior_enabled: bool = False,
-             time_prior_weight: float = 0.0) -> None:
+             time_prior_weight: float = 0.0,
+             gt_enabled: bool = False) -> None:
     n = len(rows)
     by_section = Counter(r["pred_id"] for r in rows)
     overall_conf = sum(r["conf"] for r in rows) / max(1, n)
@@ -554,6 +674,10 @@ def write_md(rows: list[dict], path: Path, template: dict, audio_path: Path,
         out.append(f"- VAD: {vocal_pct:.1f}% of windows have vocals")
     if time_prior_enabled:
         out.append(f"- Time prior weight: {time_prior_weight:.1f}")
+
+    if gt_enabled:
+        out += [""] + _accuracy_md_block(rows)
+
     out += [
         "",
         "## Predicted section distribution",
@@ -647,7 +771,8 @@ def write_html(rows: list[dict], path: Path, template: dict,
                audio_path: Path, sections: list[tuple[str, str, np.ndarray]],
                smooth_enabled: bool = False,
                vad_enabled: bool = False,
-               time_prior_enabled: bool = False) -> None:
+               time_prior_enabled: bool = False,
+               gt_enabled: bool = False) -> None:
     section_ids = [sid for sid, _stype, _frames in sections]
     color_map = {sid: _section_color(i, len(section_ids))
                  for i, sid in enumerate(section_ids)}
@@ -666,7 +791,10 @@ def write_html(rows: list[dict], path: Path, template: dict,
     # Stack one strip per enabled output. Single- and two-strip layouts match
     # the pre-VAD output byte-for-byte so --vad-penalty 0.0 (and additionally
     # --transition-penalty 0.0) preserves earlier behaviour.
-    strips: list[str] = ["raw"]
+    strips: list[str] = []
+    if gt_enabled:
+        strips.append("ground_truth")
+    strips.append("raw")
     if time_prior_enabled:
         strips.append("time_prior")
     if smooth_enabled:
@@ -742,6 +870,7 @@ def write_html(rows: list[dict], path: Path, template: dict,
     strip_labels = {
         "raw": "Raw", "smoothed": "Smoothed",
         "vad": "VAD", "time_prior": "Time prior",
+        "ground_truth": "Ground truth",
     }
     for kind, sy, ly in zip(strips, strip_y, label_y):
         if ly is not None:
@@ -759,6 +888,13 @@ def write_html(rows: list[dict], path: Path, template: dict,
                 opacity = "1.00"
             elif kind == "time_prior":
                 color = color_map.get(r["time_prior_id"], "#999")
+                opacity = "1.00"
+            elif kind == "ground_truth":
+                gt = r.get("gt_section_id")
+                if gt is None or gt.startswith("_"):
+                    color = "#eeeeee"  # gap or excluded section
+                else:
+                    color = color_map.get(gt, "#999")
                 opacity = "1.00"
             else:  # vad
                 color = VAD_VOCAL_COLOR if r["has_vocals"] else VAD_QUIET_COLOR
@@ -807,6 +943,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         "template's reference timeline says should be playing "
                         "at this elapsed time (half-bonus to its neighbours). "
                         "0.0 disables the time prior (default 2.0).")
+    p.add_argument("--ground-truth", type=Path, default=None,
+                   help="Optional path to a tooling/ground_truth/<song>.json file. "
+                        "When set, the report includes accuracy numbers against "
+                        "these labels and the HTML chart adds a ground-truth row "
+                        "at the top.")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -871,6 +1012,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     smooth_enabled = args.transition_penalty > 0.0
     vad_enabled = args.vad_penalty > 0.0
     time_prior_enabled = args.time_prior_weight > 0.0
+    gt_enabled = args.ground_truth is not None
+
+    gt_intervals: list[tuple[str, float, float]] = []
+    if gt_enabled:
+        gt_intervals = load_ground_truth(args.ground_truth)
+        log.info("Loaded %d ground-truth intervals from %s",
+                 len(gt_intervals), args.ground_truth)
 
     has_vocals = np.zeros(scored, dtype=bool)
     if vad_enabled and scored > 0:
@@ -935,6 +1083,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         confidence = float(sims[raw_i])
         second = float(sims[int(order[1])]) if len(order) > 1 else 0.0
         tp_i = int(expected_idx[w])
+        gt_sid = None
+        if gt_enabled:
+            gt_sid = gt_section_at(times[w] + WINDOW_SEC / 2, gt_intervals)
         rows.append({
             "time": times[w],
             "pred_id": sections[raw_i][0],
@@ -947,6 +1098,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "has_vocals": bool(has_vocals[w]) if w < len(has_vocals) else False,
             "time_prior_id": sections[tp_i][0],
             "time_prior_type": sections[tp_i][1],
+            "gt_section_id": gt_sid,
         })
 
     out_prefix = Path(args.out)
@@ -960,11 +1112,13 @@ def main(argv: Optional[list[str]] = None) -> int:
              smooth_enabled=smooth_enabled,
              vad_enabled=vad_enabled,
              time_prior_enabled=time_prior_enabled,
-             time_prior_weight=args.time_prior_weight)
+             time_prior_weight=args.time_prior_weight,
+             gt_enabled=gt_enabled)
     write_html(rows, html_path, template, args.audio, sections,
                smooth_enabled=smooth_enabled,
                vad_enabled=vad_enabled,
-               time_prior_enabled=time_prior_enabled)
+               time_prior_enabled=time_prior_enabled,
+               gt_enabled=gt_enabled)
 
     print(f"\nWrote {csv_path}, {md_path.name}, {html_path.name} ({len(rows)} windows)")
     return 0

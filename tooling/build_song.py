@@ -75,6 +75,30 @@ EMBED_DECIMALS = 4  # round floats in the JSON to keep file size sane
 # via whisper-matched words (interpolated lines don't count).
 MIN_MATCH_FRAC = 0.25
 
+GROUND_TRUTH_DIR = Path(__file__).resolve().parent / "ground_truth"
+
+
+def load_ground_truth(song_id: str) -> Optional[dict[str, tuple[float, float]]]:
+    """Return {section_id: (start_sec, end_sec)} from tooling/ground_truth/<song_id>.json,
+    or None if no file exists.
+
+    Section IDs beginning with `_` (e.g. `_silence`) are kept here so the
+    validator can later mask them out of accuracy reporting; build_song
+    itself just ignores any GT section that isn't in the template.
+    """
+    path = GROUND_TRUTH_DIR / f"{song_id}.json"
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text())
+    out: dict[str, tuple[float, float]] = {}
+    for s in data.get("sections", []):
+        sid = s.get("section_id")
+        if sid is None or "start" not in s or "end" not in s:
+            continue
+        out[sid] = (float(s["start"]), float(s["end"]))
+    log.info("Using ground truth from %s (%d sections).", path, len(out))
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Embedding model loader
@@ -199,14 +223,21 @@ def align_reference(audio_path: Path, template: dict, model_size: str,
 # ---------------------------------------------------------------------------
 
 def process_reference(audio_path: Path, template: dict, extractor: EmbeddingExtractor,
-                      model_size: str, vad_filter: bool = False) -> dict:
+                      model_size: str, vad_filter: bool = False,
+                      ground_truth: Optional[dict[str, tuple[float, float]]] = None) -> dict:
     """Returns {
         "filename": "...",
         "spans": {(section_id, line_idx): {start_sec, end_sec, ...}, ...},
         "line_embeddings": {(section_id, line_idx): np.ndarray | None},
         "section_sequences": {section_id: [np.ndarray, ...]},
         "section_bounds": {section_id: (start_sec, end_sec)},
+        "bounds_source": {section_id: "ground_truth" | "whisper"},
     }
+
+    When `ground_truth` is provided, its bounds override the Whisper-derived
+    bounds for any section it covers. Line spans are clipped to their parent
+    section's GT bounds; lines whose Whisper alignment falls entirely outside
+    the GT range are dropped with a warning.
     """
     log.info("[%s] aligning ...", audio_path.name)
     spans = align_reference(audio_path, template, model_size, vad_filter=vad_filter)
@@ -215,37 +246,67 @@ def process_reference(audio_path: Path, template: dict, extractor: EmbeddingExtr
     extractor.load()
     y_embed = load_audio_for_embedding(audio_path, extractor.sample_rate)
     audio_duration = len(y_embed) / extractor.sample_rate if extractor.sample_rate else 0.0
+    gt = ground_truth or {}
 
-    # Line-level embeddings.
+    # Line-level embeddings, clipped to GT section bounds when available.
     line_embeddings: dict = {}
     for section in template["structure"]:
+        sid = section["section_id"]
+        gt_bounds = gt.get(sid)
         for line in section["lines"]:
-            key = (section["section_id"], line["line_index"])
+            key = (sid, line["line_index"])
             if key not in spans:
                 line_embeddings[key] = None
                 continue
             sp = spans[key]
-            audio_slice = slice_audio(y_embed, extractor.sample_rate,
-                                      sp["start_sec"], sp["end_sec"])
+            s0, s1 = sp["start_sec"], sp["end_sec"]
+            if gt_bounds is not None:
+                gs, ge = gt_bounds
+                clipped_s = max(s0, gs)
+                clipped_e = min(s1, ge)
+                if clipped_e <= clipped_s:
+                    log.warning(
+                        "[%s] line %s/%d Whisper span [%.2f, %.2f] is outside "
+                        "GT bounds [%.2f, %.2f]; dropping.",
+                        audio_path.name, sid, line["line_index"],
+                        s0, s1, gs, ge,
+                    )
+                    line_embeddings[key] = None
+                    continue
+                s0, s1 = clipped_s, clipped_e
+                sp["start_sec"], sp["end_sec"] = s0, s1
+            audio_slice = slice_audio(y_embed, extractor.sample_rate, s0, s1)
             line_embeddings[key] = extractor.embed(audio_slice)
 
-    # Section-level embedding sequences. Three passes so every section --
-    # including pure-instrumental intro/jam/outro -- gets a non-empty
-    # sequence (otherwise the live position tracker has nothing to lock
-    # onto during the parts of the song without lyric anchors).
+    # Section-level embedding sequences. When ground truth is present every
+    # section in GT uses its bounds directly; everything else follows the
+    # three-pass fallback (line-derived, then neighbour-derived) we used
+    # before.
     sec_ids = [s["section_id"] for s in template["structure"]]
     bounds: dict[str, tuple[float, float]] = {}
+    bounds_source: dict[str, str] = {}
 
-    # Pass 1: bounds from the line spans we got from alignment.
+    if gt:
+        for sid in sec_ids:
+            if sid in gt:
+                bounds[sid] = gt[sid]
+                bounds_source[sid] = "ground_truth"
+
+    # Pass 1: bounds from the line spans we got from alignment (already
+    # clipped above when GT is present). Only fills sections still missing.
     for section in template["structure"]:
-        starts = [spans[(section["section_id"], l["line_index"])]["start_sec"]
+        sid = section["section_id"]
+        if sid in bounds:
+            continue
+        starts = [spans[(sid, l["line_index"])]["start_sec"]
                   for l in section["lines"]
-                  if (section["section_id"], l["line_index"]) in spans]
-        ends = [spans[(section["section_id"], l["line_index"])]["end_sec"]
+                  if (sid, l["line_index"]) in spans]
+        ends = [spans[(sid, l["line_index"])]["end_sec"]
                 for l in section["lines"]
-                if (section["section_id"], l["line_index"]) in spans]
+                if (sid, l["line_index"]) in spans]
         if starts and ends:
-            bounds[section["section_id"]] = (max(0.0, min(starts) - 0.5), max(ends) + 0.5)
+            bounds[sid] = (max(0.0, min(starts) - 0.5), max(ends) + 0.5)
+            bounds_source[sid] = "whisper"
 
     # Pass 2: fill remaining sections from neighbours in song order.
     for i, sid in enumerate(sec_ids):
@@ -264,6 +325,7 @@ def process_reference(audio_path: Path, template: dict, extractor: EmbeddingExtr
         sec_start = prev_end if prev_end is not None else 0.0
         sec_end = next_start if next_start is not None else audio_duration
         bounds[sid] = (sec_start, sec_end)
+        bounds_source[sid] = "whisper"
 
     # Pass 3: embed every section at SECTION_SLICE_SEC intervals.
     section_sequences: dict = {}
@@ -292,6 +354,9 @@ def process_reference(audio_path: Path, template: dict, extractor: EmbeddingExtr
         # fields on every section -- including the instrumental ones the
         # time-prior validator needs.
         "section_bounds": dict(bounds),
+        # Records which source produced each section's bounds so inspect_template
+        # (and downstream debugging) can verify ground truth was actually used.
+        "bounds_source": dict(bounds_source),
     }
 
 
@@ -371,6 +436,12 @@ def assemble_template(lyrics_path: Path, song_id: str, title: str,
         structure=sections,
     ))
 
+    ground_truth = load_ground_truth(song_id)
+    if ground_truth is None:
+        log.info("Using Whisper-aligned bounds (no ground truth found for %s).",
+                 song_id)
+    template["ground_truth_used"] = ground_truth is not None
+
     n_lines_total = sum(len(s["lines"]) for s in template["structure"])
 
     # Global audio features from the first reference that loads successfully.
@@ -389,7 +460,8 @@ def assemble_template(lyrics_path: Path, song_id: str, title: str,
     for ref in references:
         try:
             result = process_reference(ref, template, extractor, model_size,
-                                       vad_filter=vad_filter)
+                                       vad_filter=vad_filter,
+                                       ground_truth=ground_truth)
         except Exception as exc:  # noqa: BLE001
             log.warning("reference %s failed (%s); continuing with the rest",
                         ref.name, exc)
@@ -481,6 +553,22 @@ def _populate_sections(template: dict, per_ref: list[dict]) -> None:
             section["start_sec"] = round(max(0.0, min(starts) - 0.5), 3)
         if ends:
             section["end_sec"] = round(max(ends) + 0.5, 3)
+
+        # If any reference reported this section's bounds came from ground
+        # truth, all of them did (it's a per-song decision) -- promote the
+        # GT bounds directly and tag the source. Otherwise mark as whisper.
+        sources_seen = {r.get("bounds_source", {}).get(sid) for r in per_ref}
+        sources_seen.discard(None)
+        if "ground_truth" in sources_seen:
+            gt_bounds = [r["section_bounds"][sid] for r in per_ref
+                         if r.get("bounds_source", {}).get(sid) == "ground_truth"
+                         and sid in r.get("section_bounds", {})]
+            if gt_bounds:
+                section["start_time"] = round(float(gt_bounds[0][0]), 3)
+                section["end_time"] = round(float(gt_bounds[0][1]), 3)
+                section["bounds_source"] = "ground_truth"
+                continue
+        section["bounds_source"] = "whisper"
 
         # Explicit start_time / end_time on every section -- this is what the
         # time-prior validator reads. Vocal sections use first-line-start /

@@ -74,11 +74,19 @@ jobs:
             echo "::error::Template not found: $TEMPLATE"
             exit 1
           fi
-          python tooling/validate_position.py \
-            --template "$TEMPLATE" \
-            --audio validation/band_recording \
-            --out "validation/${SLUG}_validation" \
-            -v
+          # GT files are named with the song_id (underscore form) -- match
+          # the slug-normalisation the add-song workflow uses.
+          gt_slug=$(python -c "import re,sys,unicodedata; s=unicodedata.normalize('NFKD',sys.argv[1]).encode('ascii','ignore').decode(); print(re.sub(r'[^a-z0-9]+','_',s.lower()).strip('_'))" "$SLUG")
+          gt_path="tooling/ground_truth/${gt_slug}.json"
+          args=(--template "$TEMPLATE" --audio validation/band_recording \
+                --out "validation/${SLUG}_validation" -v)
+          if [[ -f "$gt_path" ]]; then
+            echo "Found ground truth: $gt_path"
+            args+=(--ground-truth "$gt_path")
+          else
+            echo "No ground truth at $gt_path; accuracy stats will be omitted."
+          fi
+          python tooling/validate_position.py "${args[@]}"
           ls -la validation/
 
       - name: Append markdown report to summary

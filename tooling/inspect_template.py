@@ -143,6 +143,10 @@ def report(template: dict, n_attempted_refs: Optional[int] = None) -> str:
     """Multi-line summary string. Used by both the inspector and the builder."""
     stats = compute_stats(template)
     attempted = n_attempted_refs if n_attempted_refs is not None else len(stats["references"])
+    n_gt = sum(
+        1 for s in template.get("structure", [])
+        if s.get("bounds_source") == "ground_truth"
+    )
     out: list[str] = [
         "Template build report:",
         f"  references included: {len(stats['references'])} (of {attempted} attempted)",
@@ -151,6 +155,8 @@ def report(template: dict, n_attempted_refs: Optional[int] = None) -> str:
         f"(instrumental: {stats['n_instrumental_sections']}, "
         f"vocal: {stats['n_vocal_sections']})",
         f"    sections with non-empty audio_embedding_sequence: {stats['n_sections_with_seq']}",
+        f"    bounds source: ground_truth={n_gt}, "
+        f"whisper={stats['n_sections'] - n_gt}",
         f"  lines: {stats['n_lines']}",
     ]
     rates = stats["per_reference_match_rates"]
@@ -176,7 +182,7 @@ def report(template: dict, n_attempted_refs: Optional[int] = None) -> str:
 def section_table(template: dict) -> str:
     """Per-section breakdown table."""
     headers = ["section_id", "type", "start_time", "end_time", "duration",
-               "n_lines", "n_frames", "n_unique_timings"]
+               "bounds_source", "n_lines", "n_frames", "n_unique_timings"]
     rows: list[list[str]] = [headers]
     for section in template.get("structure", []):
         lines = section.get("lines", [])
@@ -200,6 +206,7 @@ def section_table(template: dict) -> str:
             _fmt_sec(st),
             _fmt_sec(et),
             _fmt_sec(dur),
+            str(section.get("bounds_source") or "-"),
             str(len(lines)),
             str(len(seq)),
             str(len(unique)),

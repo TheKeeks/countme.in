@@ -17,6 +17,11 @@ on:
         required: false
         type: string
         default: 'peggy-o'
+      song_offset:
+        description: 'Seconds of pre-song audio to skip when applying the time prior'
+        required: false
+        type: number
+        default: 0.0
 
 permissions:
   contents: read
@@ -68,6 +73,7 @@ jobs:
         env:
           TEMPLATE: ${{ inputs.template_path }}
           SLUG: ${{ inputs.song_slug }}
+          SONG_OFFSET: ${{ inputs.song_offset }}
         run: |
           set -euo pipefail
           if [[ ! -f "$TEMPLATE" ]]; then
@@ -79,7 +85,8 @@ jobs:
           gt_slug=$(python -c "import re,sys,unicodedata; s=unicodedata.normalize('NFKD',sys.argv[1]).encode('ascii','ignore').decode(); print(re.sub(r'[^a-z0-9]+','_',s.lower()).strip('_'))" "$SLUG")
           gt_path="tooling/ground_truth/${gt_slug}.json"
           args=(--template "$TEMPLATE" --audio validation/band_recording \
-                --out "validation/${SLUG}_validation" -v)
+                --out "validation/${SLUG}_validation" \
+                --song-offset "$SONG_OFFSET" -v)
           if [[ -f "$gt_path" ]]; then
             echo "Found ground truth: $gt_path"
             args+=(--ground-truth "$gt_path")

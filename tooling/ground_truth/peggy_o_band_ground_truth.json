@@ -1,0 +1,21 @@
+{
+  "song_id": "peggy_o",
+  "audio_source": "band_recording",
+  "labeled_by": "manual",
+  "song_offset_sec": 20.0,
+  "notes": "Times are absolute audio timestamps (not shifted). Audio includes 20s of pre-song noodling. Use --song-offset 20.0 in validator so the time prior anchors to song start, not audio t=0. Section IDs starting with underscore are excluded from accuracy calculation.",
+  "sections": [
+    {"section_id": "_noodling",    "start": 0,   "end": 20,  "lyric_cue": null, "notes": "Band noodling before song proper starts"},
+    {"section_id": "intro_1",      "start": 20,  "end": 33,  "lyric_cue": null, "notes": "Band intro is much shorter than Dead's 53s reference"},
+    {"section_id": "verse_1",      "start": 33,  "end": 67,  "lyric_cue": "as we rode out"},
+    {"section_id": "verse_2",      "start": 67,  "end": 103, "lyric_cue": "will you marry me"},
+    {"section_id": "verse_3",      "start": 103, "end": 138, "lyric_cue": "I would marry you"},
+    {"section_id": "verse_4",      "start": 138, "end": 174, "lyric_cue": "what would your mama think"},
+    {"section_id": "jam_1",        "start": 174, "end": 280, "lyric_cue": null, "notes": "Solo, 3 times through verse progression"},
+    {"section_id": "verse_5",      "start": 280, "end": 315, "lyric_cue": "if ever I return"},
+    {"section_id": "verse_6",      "start": 315, "end": 350, "lyric_cue": "come steppin down the stairs"},
+    {"section_id": "verse_7",      "start": 350, "end": 385, "lyric_cue": "sweet william he is dead"},
+    {"section_id": "verse_8",      "start": 385, "end": 429, "lyric_cue": "as we rode out (verse 1 reprise)", "notes": "Band repeats last line over outro walkdown — no separate outro_1 section. MERT may predict outro_1 here, which will count as wrong but is informative."},
+    {"section_id": "_band_chatter","start": 429, "end": 9999, "lyric_cue": null, "notes": "Post-song chatter, exclude from accuracy"}
+  ]
+}

@@ -102,6 +102,49 @@ def _ensure_wav(audio_path: Path, target_sr: int = 16000) -> Path:
     return wav_path
 
 
+def _vocal_stem_rms_db(vocals_path: Path) -> float:
+    """RMS energy of the vocal stem in dBFS. A very low value (< ~-50 dB)
+    suggests the source separator found ~no vocal content even though it
+    produced an output file.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    y, _sr = sf.read(str(vocals_path))
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    rms = float(np.sqrt(np.mean(y.astype(np.float64) ** 2)))
+    return 20.0 * float(np.log10(max(rms, 1e-12)))
+
+
+def _separate_vocals(audio_path: Path) -> tuple[Path, Path, float]:
+    """Run Demucs htdemucs on `audio_path` and return (vocals_wav,
+    cleanup_dir, rms_db).
+
+    Caller is responsible for `shutil.rmtree(cleanup_dir)` once it's
+    done with the vocals stem. We use --two-stems vocals so Demucs only
+    writes the vocal + no_vocal split instead of all four stems.
+    """
+    out_dir = Path(tempfile.mkdtemp(prefix="demucs_"))
+    print("  running Demucs (htdemucs, two-stem vocals) ...", flush=True)
+    subprocess.run(
+        [sys.executable, "-m", "demucs.separate",
+         "-n", "htdemucs",
+         "--two-stems", "vocals",
+         "-o", str(out_dir),
+         str(audio_path)],
+        check=True,
+    )
+    candidates = list(out_dir.rglob("vocals.wav"))
+    if not candidates:
+        raise RuntimeError(
+            f"Demucs ran but produced no vocals.wav under {out_dir}"
+        )
+    vocals_path = candidates[0]
+    rms_db = _vocal_stem_rms_db(vocals_path)
+    return vocals_path, out_dir, rms_db
+
+
 def _transcribe(audio_path: Path, model_size: str) -> tuple[str, list[dict]]:
     """Return (full_text, [{"word", "start", "end"}, ...]).
 
@@ -196,9 +239,28 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Whisper model size: tiny / base / small (default base).")
     p.add_argument("--output", type=Path, default=None,
                    help="Optional path to write a detailed JSON report.")
+    p.add_argument("--separate-vocals", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Run Demucs htdemucs to isolate the vocal stem before "
+                        "transcribing. Off by default; recommended on band-stage "
+                        "audio where vocals are buried under instruments.")
     args = p.parse_args(argv)
 
-    wav_path = _ensure_wav(args.audio)
+    cleanup_dirs: list[Path] = []
+    vocal_rms_db: Optional[float] = None
+    audio_for_whisper: Path = args.audio
+
+    if args.separate_vocals:
+        print("Running Demucs vocal isolation...", flush=True)
+        vocals_path, demucs_dir, vocal_rms_db = _separate_vocals(args.audio)
+        cleanup_dirs.append(demucs_dir)
+        print(
+            f"Vocal stem isolated, RMS energy: {vocal_rms_db:.1f} dB",
+            flush=True,
+        )
+        audio_for_whisper = vocals_path
+
+    wav_path = _ensure_wav(audio_for_whisper)
     try:
         full_text, words = _transcribe(wav_path, args.model)
     finally:
@@ -206,6 +268,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             os.unlink(wav_path)
         except OSError:
             pass
+        for d in cleanup_dirs:
+            try:
+                import shutil  # noqa: PLC0415
+                shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                pass
 
     # Restrict matching to audio_t >= tap_time. Use word.start so a long
     # word straddling the tap doesn't slip through.
@@ -274,12 +342,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             "tap_time": args.tap_time,
             "ground_truth_time": args.ground_truth_time,
             "model": args.model,
+            "vocal_separation_used": bool(args.separate_vocals),
             "transcript_full_text": full_text,
             "transcript_words": words,
             "candidates": candidates,
             "first_match": first_match,
             "best_match": best_match,
         }
+        if vocal_rms_db is not None:
+            report["vocal_stem_rms_db"] = vocal_rms_db
         if first_err is not None:
             report["first_match_error_sec"] = first_err
             report["best_match_error_sec"] = best_err

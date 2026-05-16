@@ -30,6 +30,11 @@ on:
           - tiny
           - base
           - small
+      separate_vocals:
+        description: 'Run Demucs vocal isolation before Whisper (slower but the recommended path on band audio)'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -53,13 +58,21 @@ jobs:
           python-version: '3.11'
           cache: pip
 
+      - name: Cache Demucs model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch/hub
+          key: torch-hub-htdemucs-${{ runner.os }}-v1
+
       - name: Install Python deps
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           # faster-whisper preferred; openai-whisper is the fallback the
-          # script knows how to use if this install ever fails.
-          pip install "faster-whisper>=1.0" "librosa>=0.10" "rapidfuzz>=3.0"
+          # script knows how to use if this install ever fails. Demucs
+          # pulls torch + torchaudio in as transitive deps.
+          pip install "faster-whisper>=1.0" "librosa>=0.10" "rapidfuzz>=3.0" "demucs>=4.0"
+          python -c "import torch; print('torch', torch.__version__)"
 
       - name: Download audio
         env:
@@ -87,6 +100,7 @@ jobs:
           TAP_TIME: ${{ inputs.tap_time }}
           GT_TIME: ${{ inputs.ground_truth_time }}
           WHISPER_MODEL: ${{ inputs.whisper_model }}
+          SEPARATE_VOCALS: ${{ inputs.separate_vocals }}
         run: |
           set -euo pipefail
           args=(--audio detect/audio --search-text "$SEARCH_TEXT" \
@@ -94,6 +108,11 @@ jobs:
                 --output detect/report.json)
           if [[ -n "${GT_TIME:-}" ]]; then
             args+=(--ground-truth-time "$GT_TIME")
+          fi
+          if [[ "$SEPARATE_VOCALS" == "true" ]]; then
+            args+=(--separate-vocals)
+          else
+            args+=(--no-separate-vocals)
           fi
           python tooling/detect_first_verse.py "${args[@]}" | tee detect/stdout.txt
 

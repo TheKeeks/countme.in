@@ -71,7 +71,7 @@ jobs:
           # faster-whisper preferred; openai-whisper is the fallback the
           # script knows how to use if this install ever fails. Demucs
           # pulls torch + torchaudio in as transitive deps.
-          pip install "faster-whisper>=1.0" "librosa>=0.10" "rapidfuzz>=3.0" "demucs>=4.0"
+          pip install "faster-whisper>=1.0" "librosa>=0.10" "rapidfuzz>=3.0" "demucs>=4.0" torchcodec
           python -c "import torch; print('torch', torch.__version__)"
 
       - name: Download audio

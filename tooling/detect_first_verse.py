@@ -121,6 +121,101 @@ def _vocal_stem_rms_db(vocals_path: Path) -> float:
     return 20.0 * float(np.log10(max(rms, 1e-12)))
 
 
+# ---------------------------------------------------------------------------
+# Energy-based onset detection (the recommended path on band audio)
+# ---------------------------------------------------------------------------
+
+ENERGY_FRAME_MS = 100
+ENERGY_SMOOTHING_SEC = 1.0
+ENERGY_SUSTAIN_SEC = 1.5
+
+
+def _energy_envelope(vocals_path: Path,
+                     frame_ms: int = ENERGY_FRAME_MS
+                     ) -> tuple["np.ndarray", "np.ndarray"]:  # type: ignore[name-defined]
+    """Per-frame RMS-in-dBFS envelope of the vocal stem.
+
+    Returns (times_sec, db) arrays at `frame_ms` resolution. The dB floor
+    is clipped at -240 (1e-12 raw RMS) so silent frames don't go to -inf.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    y, sr = sf.read(str(vocals_path))
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    y = y.astype(np.float64)
+    frame_samples = int(sr * frame_ms / 1000)
+    n_frames = len(y) // frame_samples
+    if n_frames == 0:
+        return np.zeros(0), np.zeros(0)
+    # Reshape to (n_frames, frame_samples) for vectorised RMS.
+    trimmed = y[: n_frames * frame_samples].reshape(n_frames, frame_samples)
+    rms = np.sqrt(np.mean(trimmed ** 2, axis=1))
+    db = 20.0 * np.log10(np.maximum(rms, 1e-12))
+    times = np.arange(n_frames) * (frame_ms / 1000.0)
+    return times, db
+
+
+def _moving_average(arr: "np.ndarray", window: int) -> "np.ndarray":  # type: ignore[name-defined]
+    import numpy as np
+    if window <= 1 or len(arr) == 0:
+        return arr.astype(np.float64, copy=True)
+    kernel = np.ones(window, dtype=np.float64) / window
+    return np.convolve(arr, kernel, mode="same")
+
+
+def _find_sustained_crossing(times: "np.ndarray",  # type: ignore[name-defined]
+                             db: "np.ndarray",  # type: ignore[name-defined]
+                             threshold_db: float,
+                             sustain_sec: float,
+                             tap_time: float) -> Optional[float]:
+    """First time t >= tap_time at which `db` crosses above `threshold_db`
+    and stays above for at least `sustain_sec` consecutive seconds.
+
+    Returns None when no such crossing fits within the available audio.
+    """
+    import numpy as np
+    if len(times) == 0:
+        return None
+    dt = float(times[1] - times[0]) if len(times) > 1 else ENERGY_FRAME_MS / 1000.0
+    sustain_frames = max(1, int(np.ceil(sustain_sec / dt)))
+    above = db >= threshold_db
+    n = len(times)
+    for i in range(n):
+        if times[i] < tap_time:
+            continue
+        if not above[i]:
+            continue
+        end = i + sustain_frames
+        if end > n:
+            return None  # not enough audio remaining to verify sustain
+        if bool(above[i:end].all()):
+            return float(times[i])
+    return None
+
+
+def _detect_energy_onset(vocals_path: Path,
+                         threshold_db: float,
+                         tap_time: float) -> tuple[Optional[float], list[dict]]:
+    """Run the energy-onset pipeline and return (onset_sec_or_None, envelope_samples).
+
+    `envelope_samples` is the smoothed dB curve at ENERGY_FRAME_MS resolution,
+    rounded for compact JSON serialisation.
+    """
+    times, db = _energy_envelope(vocals_path)
+    smoothing_window = max(1, int(round(ENERGY_SMOOTHING_SEC / (ENERGY_FRAME_MS / 1000.0))))
+    smoothed = _moving_average(db, smoothing_window)
+    onset = _find_sustained_crossing(
+        times, smoothed, threshold_db, ENERGY_SUSTAIN_SEC, tap_time,
+    )
+    envelope = [
+        {"time": round(float(t), 2), "db": round(float(d), 2)}
+        for t, d in zip(times, smoothed)
+    ]
+    return onset, envelope
+
+
 def _separate_vocals(audio_path: Path) -> tuple[Path, Path, float]:
     """Run Demucs htdemucs on `audio_path` and return (vocals_wav,
     cleanup_dir, rms_db).
@@ -254,22 +349,30 @@ def _best_match(candidates: list[dict]) -> Optional[dict]:
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     p.add_argument("--audio", type=Path, required=True)
-    p.add_argument("--search-text", required=True,
-                   help='Lyric phrase to search for (e.g. "as we rode out").')
+    p.add_argument("--detection-mode", choices=["energy", "whisper"],
+                   default="energy",
+                   help="energy (default): find the first sustained vocal-onset "
+                        "in the Demucs vocal stem. whisper: transcribe and "
+                        "fuzzy-match a lyric phrase (kept for future use).")
+    p.add_argument("--search-text", default=None,
+                   help='Lyric phrase to search for, required in --detection-mode whisper '
+                        '(e.g. "as we rode out").')
     p.add_argument("--tap-time", type=float, default=0.0,
                    help="Earliest audio time after which to consider matches "
                         "(default 0.0).")
     p.add_argument("--ground-truth-time", type=float, default=None,
                    help="Optional known verse_1 start time for error reporting.")
     p.add_argument("--model", default="base",
-                   help="Whisper model size: tiny / base / small (default base).")
+                   help="Whisper model size: tiny / base / small (default base). "
+                        "Used only in --detection-mode whisper.")
     p.add_argument("--output", type=Path, default=None,
                    help="Optional path to write a detailed JSON report.")
     p.add_argument("--separate-vocals", action=argparse.BooleanOptionalAction,
-                   default=False,
+                   default=None,
                    help="Run Demucs htdemucs to isolate the vocal stem before "
-                        "transcribing. Off by default; recommended on band-stage "
-                        "audio where vocals are buried under instruments.")
+                        "downstream processing. Defaults to ON in energy mode "
+                        "(required for it to mean anything), OFF in whisper "
+                        "mode for backward compatibility.")
     p.add_argument("--initial-prompt", default=None,
                    help="Optional text to seed Whisper's decoder. Biases the "
                         "model toward expected vocabulary -- the main lever "
@@ -279,8 +382,96 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "set, the initial prompt is built automatically from "
                         "the template's lyrics. An explicit --initial-prompt "
                         "takes precedence over this.")
+    p.add_argument("--energy-threshold-db", type=float, default=-35.0,
+                   help="dBFS threshold for the energy-mode onset detector "
+                        "(default -35.0).")
     args = p.parse_args(argv)
 
+    # Mode-conditional defaults / validation.
+    if args.separate_vocals is None:
+        args.separate_vocals = (args.detection_mode == "energy")
+    if args.detection_mode == "whisper" and not args.search_text:
+        p.error("--search-text is required in --detection-mode whisper")
+    if args.detection_mode == "energy" and not args.separate_vocals:
+        p.error("--detection-mode energy requires --separate-vocals "
+                "(the energy envelope only makes sense on the vocal stem)")
+
+    if args.detection_mode == "energy":
+        return _run_energy_mode(args)
+    return _run_whisper_mode(args)
+
+
+def _run_energy_mode(args: argparse.Namespace) -> int:
+    print("Running Demucs vocal isolation...", flush=True)
+    vocals_path, demucs_dir, vocal_rms_db = _separate_vocals(args.audio)
+    try:
+        print(f"Vocal stem isolated, RMS: {vocal_rms_db:.1f} dB", flush=True)
+        print("Computing energy envelope...", flush=True)
+        print(
+            f"Threshold: {args.energy_threshold_db:.1f} dB, "
+            f"smoothing: {ENERGY_SMOOTHING_SEC:.1f}s, "
+            f"sustain: {ENERGY_SUSTAIN_SEC:.1f}s",
+            flush=True,
+        )
+        onset, envelope = _detect_energy_onset(
+            vocals_path, args.energy_threshold_db, args.tap_time,
+        )
+    finally:
+        try:
+            import shutil  # noqa: PLC0415
+            shutil.rmtree(demucs_dir, ignore_errors=True)
+        except OSError:
+            pass
+
+    if onset is None:
+        print(
+            f"First sustained vocal onset after tap_time={args.tap_time:.1f}: "
+            f"(none above threshold within remaining audio)",
+            flush=True,
+        )
+        rc = 1
+    else:
+        print(
+            f"First sustained vocal onset after tap_time={args.tap_time:.1f}: "
+            f"audio_t={onset:.2f}s",
+            flush=True,
+        )
+        rc = 0
+
+    onset_err: Optional[float] = None
+    if args.ground_truth_time is not None and onset is not None:
+        onset_err = onset - args.ground_truth_time
+        print(
+            f"Ground truth: {args.ground_truth_time:.2f}s, "
+            f"error: {onset_err:+.2f}s",
+            flush=True,
+        )
+
+    if args.output is not None:
+        report = {
+            "audio": str(args.audio),
+            "detection_mode": "energy",
+            "tap_time": args.tap_time,
+            "ground_truth_time": args.ground_truth_time,
+            "vocal_separation_used": True,
+            "vocal_stem_rms_db": vocal_rms_db,
+            "energy_threshold_db": args.energy_threshold_db,
+            "energy_smoothing_sec": ENERGY_SMOOTHING_SEC,
+            "energy_sustain_sec": ENERGY_SUSTAIN_SEC,
+            "energy_envelope": envelope,
+            "detected_onset_sec": onset,
+        }
+        if onset_err is not None:
+            report["onset_error_sec"] = onset_err
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(report, indent=2))
+        print()
+        print(f"Wrote JSON report to {args.output}")
+
+    return rc
+
+
+def _run_whisper_mode(args: argparse.Namespace) -> int:
     # Resolve the initial prompt: --initial-prompt wins over --template.
     initial_prompt: Optional[str] = None
     initial_prompt_source: Optional[str] = None
@@ -409,6 +600,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.output is not None:
         report = {
             "audio": str(args.audio),
+            "detection_mode": "whisper",
             "search_text": args.search_text,
             "tap_time": args.tap_time,
             "ground_truth_time": args.ground_truth_time,

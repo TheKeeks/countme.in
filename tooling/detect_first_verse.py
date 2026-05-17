@@ -127,7 +127,8 @@ def _vocal_stem_rms_db(vocals_path: Path) -> float:
 
 ENERGY_FRAME_MS = 100
 ENERGY_SMOOTHING_SEC = 1.0
-ENERGY_SUSTAIN_SEC = 1.5
+ENERGY_SUSTAIN_WINDOW_SEC = 2.0
+ENERGY_SUSTAIN_TOLERANCE_DB = 5.0
 
 
 def _energy_envelope(vocals_path: Path,
@@ -168,35 +169,47 @@ def _moving_average(arr: "np.ndarray", window: int) -> "np.ndarray":  # type: ig
 def _find_sustained_crossing(times: "np.ndarray",  # type: ignore[name-defined]
                              db: "np.ndarray",  # type: ignore[name-defined]
                              threshold_db: float,
-                             sustain_sec: float,
+                             window_sec: float,
+                             tolerance_db: float,
                              tap_time: float) -> Optional[float]:
-    """First time t >= tap_time at which `db` crosses above `threshold_db`
-    and stays above for at least `sustain_sec` consecutive seconds.
+    """First rising-edge crossing of `threshold_db` after `tap_time` whose
+    next `window_sec` of energy has a median above `threshold_db - tolerance_db`.
 
-    Returns None when no such crossing fits within the available audio.
+    Strict continuous-above-threshold checking misses real vocal onsets
+    because sung phrases dip below threshold for ~100-300ms between
+    syllables. Window-median tolerates those dips while still requiring
+    that the post-crossing region is *mostly* above threshold.
+
+    Returns None when no rising-edge candidate satisfies the median check.
     """
     import numpy as np
     if len(times) == 0:
         return None
     dt = float(times[1] - times[0]) if len(times) > 1 else ENERGY_FRAME_MS / 1000.0
-    sustain_frames = max(1, int(np.ceil(sustain_sec / dt)))
-    above = db >= threshold_db
+    window_frames = max(1, int(np.ceil(window_sec / dt)))
+    median_floor = threshold_db - tolerance_db
     n = len(times)
+    # Pre-tap state is treated as "below" so the first post-tap frame at or
+    # above threshold counts as a rising edge even if the audio was already
+    # loud before the tap.
+    prev_below = True
     for i in range(n):
         if times[i] < tap_time:
             continue
-        if not above[i]:
-            continue
-        end = i + sustain_frames
-        if end > n:
-            return None  # not enough audio remaining to verify sustain
-        if bool(above[i:end].all()):
-            return float(times[i])
+        above = db[i] >= threshold_db
+        if above and prev_below:
+            end = min(i + window_frames, n)
+            window = db[i:end]
+            if len(window) > 0 and float(np.median(window)) >= median_floor:
+                return float(times[i])
+        prev_below = not above
     return None
 
 
 def _detect_energy_onset(vocals_path: Path,
                          threshold_db: float,
+                         window_sec: float,
+                         tolerance_db: float,
                          tap_time: float) -> tuple[Optional[float], list[dict]]:
     """Run the energy-onset pipeline and return (onset_sec_or_None, envelope_samples).
 
@@ -207,7 +220,7 @@ def _detect_energy_onset(vocals_path: Path,
     smoothing_window = max(1, int(round(ENERGY_SMOOTHING_SEC / (ENERGY_FRAME_MS / 1000.0))))
     smoothed = _moving_average(db, smoothing_window)
     onset = _find_sustained_crossing(
-        times, smoothed, threshold_db, ENERGY_SUSTAIN_SEC, tap_time,
+        times, smoothed, threshold_db, window_sec, tolerance_db, tap_time,
     )
     envelope = [
         {"time": round(float(t), 2), "db": round(float(d), 2)}
@@ -385,6 +398,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--energy-threshold-db", type=float, default=-35.0,
                    help="dBFS threshold for the energy-mode onset detector "
                         "(default -35.0).")
+    p.add_argument("--energy-sustain-window-sec", type=float,
+                   default=ENERGY_SUSTAIN_WINDOW_SEC,
+                   help="Length of the post-crossing window whose median dB "
+                        "must clear the tolerance line (default 2.0).")
+    p.add_argument("--energy-sustain-tolerance-db", type=float,
+                   default=ENERGY_SUSTAIN_TOLERANCE_DB,
+                   help="How far below --energy-threshold-db the window "
+                        "median is allowed to sit while still counting as "
+                        "sustained (default 5.0). Tolerates the brief dips "
+                        "between sung syllables.")
     args = p.parse_args(argv)
 
     # Mode-conditional defaults / validation.
@@ -407,14 +430,18 @@ def _run_energy_mode(args: argparse.Namespace) -> int:
     try:
         print(f"Vocal stem isolated, RMS: {vocal_rms_db:.1f} dB", flush=True)
         print("Computing energy envelope...", flush=True)
+        median_floor = args.energy_threshold_db - args.energy_sustain_tolerance_db
         print(
-            f"Threshold: {args.energy_threshold_db:.1f} dB, "
-            f"smoothing: {ENERGY_SMOOTHING_SEC:.1f}s, "
-            f"sustain: {ENERGY_SUSTAIN_SEC:.1f}s",
+            f"Looking for first crossing of {args.energy_threshold_db:.1f} dB "
+            f"with median energy in next {args.energy_sustain_window_sec:.1f}s "
+            f"above {median_floor:.1f} dB",
             flush=True,
         )
         onset, envelope = _detect_energy_onset(
-            vocals_path, args.energy_threshold_db, args.tap_time,
+            vocals_path, args.energy_threshold_db,
+            args.energy_sustain_window_sec,
+            args.energy_sustain_tolerance_db,
+            args.tap_time,
         )
     finally:
         try:
@@ -457,7 +484,8 @@ def _run_energy_mode(args: argparse.Namespace) -> int:
             "vocal_stem_rms_db": vocal_rms_db,
             "energy_threshold_db": args.energy_threshold_db,
             "energy_smoothing_sec": ENERGY_SMOOTHING_SEC,
-            "energy_sustain_sec": ENERGY_SUSTAIN_SEC,
+            "energy_sustain_window_sec": args.energy_sustain_window_sec,
+            "energy_sustain_tolerance_db": args.energy_sustain_tolerance_db,
             "energy_envelope": envelope,
             "detected_onset_sec": onset,
         }

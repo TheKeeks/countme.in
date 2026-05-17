@@ -35,6 +35,16 @@ on:
         required: false
         type: boolean
         default: true
+      initial_prompt:
+        description: 'Optional Whisper initial_prompt to bias the decoder (explicit wins over template_path)'
+        required: false
+        type: string
+        default: ''
+      template_path:
+        description: 'Optional path to a built song template JSON; lyrics are used as initial_prompt when set'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -101,6 +111,8 @@ jobs:
           GT_TIME: ${{ inputs.ground_truth_time }}
           WHISPER_MODEL: ${{ inputs.whisper_model }}
           SEPARATE_VOCALS: ${{ inputs.separate_vocals }}
+          INITIAL_PROMPT: ${{ inputs.initial_prompt }}
+          TEMPLATE_PATH: ${{ inputs.template_path }}
         run: |
           set -euo pipefail
           args=(--audio detect/audio --search-text "$SEARCH_TEXT" \
@@ -113,6 +125,12 @@ jobs:
             args+=(--separate-vocals)
           else
             args+=(--no-separate-vocals)
+          fi
+          if [[ -n "${INITIAL_PROMPT:-}" ]]; then
+            args+=(--initial-prompt "$INITIAL_PROMPT")
+          fi
+          if [[ -n "${TEMPLATE_PATH:-}" ]]; then
+            args+=(--template "$TEMPLATE_PATH")
           fi
           python tooling/detect_first_verse.py "${args[@]}" | tee detect/stdout.txt
 

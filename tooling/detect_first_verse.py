@@ -37,6 +37,10 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+# template_io lives next to this file.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from template_io import get_song_lyrics  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Text normalisation + fuzzy search
@@ -145,12 +149,24 @@ def _separate_vocals(audio_path: Path) -> tuple[Path, Path, float]:
     return vocals_path, out_dir, rms_db
 
 
-def _transcribe(audio_path: Path, model_size: str) -> tuple[str, list[dict]]:
+WHISPER_LANGUAGE = "en"
+WHISPER_TEMPERATURE = 0.0
+WHISPER_NO_SPEECH_THRESHOLD = 0.6
+
+
+def _transcribe(audio_path: Path, model_size: str,
+                initial_prompt: Optional[str] = None) -> tuple[str, list[dict]]:
     """Return (full_text, [{"word", "start", "end"}, ...]).
 
     Tries faster-whisper first (much faster than openai-whisper, smaller
     int8 footprint). Falls back to openai-whisper if faster-whisper isn't
     available.
+
+    Decoding is pinned to language=en, temperature=0.0 (deterministic; no
+    fallback resampling), no_speech_threshold=0.6. `initial_prompt` is
+    passed through to bias the decoder toward expected vocabulary when
+    set -- the main lever against the "Be out now, maybe I can't do
+    anything to leave you behind" hallucination loop we saw on band audio.
     """
     # faster-whisper
     try:
@@ -163,7 +179,12 @@ def _transcribe(audio_path: Path, model_size: str) -> tuple[str, list[dict]]:
         model = WhisperModel(model_size, compute_type="int8")
         print(f"  transcribing with faster-whisper ...", flush=True)
         segments, _info = model.transcribe(
-            str(audio_path), word_timestamps=True, language="en",
+            str(audio_path),
+            word_timestamps=True,
+            language=WHISPER_LANGUAGE,
+            temperature=WHISPER_TEMPERATURE,
+            no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+            initial_prompt=initial_prompt,
         )
         words: list[dict] = []
         text_parts: list[str] = []
@@ -191,7 +212,12 @@ def _transcribe(audio_path: Path, model_size: str) -> tuple[str, list[dict]]:
     model = whisper.load_model(model_size)
     print(f"  transcribing with openai-whisper ...", flush=True)
     result = model.transcribe(
-        str(audio_path), word_timestamps=True, language="en",
+        str(audio_path),
+        word_timestamps=True,
+        language=WHISPER_LANGUAGE,
+        temperature=WHISPER_TEMPERATURE,
+        no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+        initial_prompt=initial_prompt,
     )
     words = []
     for seg in result.get("segments") or []:
@@ -244,7 +270,50 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Run Demucs htdemucs to isolate the vocal stem before "
                         "transcribing. Off by default; recommended on band-stage "
                         "audio where vocals are buried under instruments.")
+    p.add_argument("--initial-prompt", default=None,
+                   help="Optional text to seed Whisper's decoder. Biases the "
+                        "model toward expected vocabulary -- the main lever "
+                        "against hallucinated loops on weak audio.")
+    p.add_argument("--template", type=Path, default=None,
+                   help="Optional path to a built song template JSON. When "
+                        "set, the initial prompt is built automatically from "
+                        "the template's lyrics. An explicit --initial-prompt "
+                        "takes precedence over this.")
     args = p.parse_args(argv)
+
+    # Resolve the initial prompt: --initial-prompt wins over --template.
+    initial_prompt: Optional[str] = None
+    initial_prompt_source: Optional[str] = None
+    if args.initial_prompt:
+        initial_prompt = args.initial_prompt
+        initial_prompt_source = "explicit"
+        snippet = initial_prompt[:120]
+        ellipsis = "..." if len(initial_prompt) > 120 else ""
+        print(
+            f"Initial prompt from --initial-prompt (explicit): {snippet}{ellipsis}",
+            flush=True,
+        )
+    elif args.template is not None:
+        template_dict = json.loads(args.template.read_text())
+        derived = get_song_lyrics(template_dict)
+        if derived:
+            initial_prompt = derived
+            initial_prompt_source = "template"
+            snippet = derived[:120]
+            ellipsis = "..." if len(derived) > 120 else ""
+            print(
+                f"Initial prompt from --template ({args.template}): "
+                f"{snippet}{ellipsis}",
+                flush=True,
+            )
+        else:
+            print(
+                f"--template ({args.template}) had no lyric lines; "
+                f"no initial prompt",
+                flush=True,
+            )
+    else:
+        print("No initial prompt", flush=True)
 
     cleanup_dirs: list[Path] = []
     vocal_rms_db: Optional[float] = None
@@ -262,7 +331,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     wav_path = _ensure_wav(audio_for_whisper)
     try:
-        full_text, words = _transcribe(wav_path, args.model)
+        full_text, words = _transcribe(
+            wav_path, args.model, initial_prompt=initial_prompt,
+        )
     finally:
         try:
             os.unlink(wav_path)
@@ -343,6 +414,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             "ground_truth_time": args.ground_truth_time,
             "model": args.model,
             "vocal_separation_used": bool(args.separate_vocals),
+            "initial_prompt_used": initial_prompt is not None,
+            "initial_prompt_text": initial_prompt,
+            "initial_prompt_source": initial_prompt_source,
+            "whisper_language": WHISPER_LANGUAGE,
+            "whisper_temperature": WHISPER_TEMPERATURE,
             "transcript_full_text": full_text,
             "transcript_words": words,
             "candidates": candidates,

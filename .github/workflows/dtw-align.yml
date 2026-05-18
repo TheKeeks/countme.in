@@ -1,0 +1,115 @@
+name: DTW align
+
+on:
+  workflow_dispatch:
+    inputs:
+      audio_url:
+        description: 'Direct download URL for the test audio (Dropbox ?dl=0 auto-flipped to ?dl=1)'
+        required: true
+        type: string
+      song_id:
+        description: 'Song id (template at tooling/songs/<song_id>_aligned.json)'
+        required: true
+        type: string
+      ground_truth_path:
+        description: 'Optional repo-relative path to a ground-truth JSON, e.g. tooling/ground_truth/peggy_o.json'
+        required: false
+        type: string
+        default: ''
+      song_offset:
+        description: 'Seconds of pre-song audio to skip on the test side before DTW (default 0.0)'
+        required: false
+        type: number
+        default: 0.0
+
+permissions:
+  contents: read
+
+jobs:
+  align:
+    name: Run offline DTW alignment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: tooling/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r tooling/requirements.txt
+
+      - name: Download audio
+        env:
+          AUDIO_URL: ${{ inputs.audio_url }}
+        run: |
+          set -euo pipefail
+          url="$AUDIO_URL"
+          if [[ "$url" == *"dropbox.com"* ]]; then
+            url="${url/?dl=0/?dl=1}"
+            case "$url" in
+              *\?dl=1*) ;;
+              *\?*) url="${url}&dl=1" ;;
+              *) url="${url}?dl=1" ;;
+            esac
+          fi
+          mkdir -p dtw
+          echo "Downloading audio from: $url"
+          # ffmpeg-pre-convert inside the script handles arbitrary containers.
+          curl -L --fail --max-time 600 -o dtw/audio "$url"
+          ls -la dtw/audio
+
+      - name: Run DTW alignment
+        env:
+          SONG_ID: ${{ inputs.song_id }}
+          GT_PATH: ${{ inputs.ground_truth_path }}
+          SONG_OFFSET: ${{ inputs.song_offset }}
+        run: |
+          set -euo pipefail
+          template="tooling/songs/${SONG_ID}_aligned.json"
+          if [[ ! -f "$template" ]]; then
+            echo "::error::Template not found: $template"
+            exit 1
+          fi
+          args=(--template "$template" --audio dtw/audio \
+                --song-offset "$SONG_OFFSET" \
+                --output-md dtw/validation.md \
+                --output-json dtw/validation.json \
+                -v)
+          if [[ -n "${GT_PATH:-}" ]]; then
+            if [[ ! -f "$GT_PATH" ]]; then
+              echo "::error::Ground truth not found: $GT_PATH"
+              exit 1
+            fi
+            args+=(--ground-truth "$GT_PATH")
+          fi
+          python tooling/dtw_align.py "${args[@]}"
+          ls -la dtw/
+
+      - name: Append markdown report to job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f dtw/validation.md ]]; then
+            cat dtw/validation.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload DTW report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtw-${{ inputs.song_id }}
+          path: |
+            dtw/validation.md
+            dtw/validation.json
+          if-no-files-found: error
+          retention-days: 30

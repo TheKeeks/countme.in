@@ -53,8 +53,16 @@ on:
         options:
           - energy
           - whisper
+      energy_threshold_mode:
+        description: 'auto = derive threshold from baseline window after tap (recommended). fixed = use energy_threshold_db as the absolute threshold.'
+        required: false
+        type: choice
+        default: auto
+        options:
+          - auto
+          - fixed
       energy_threshold_db:
-        description: 'dBFS threshold for the energy-mode onset detector (default -35.0)'
+        description: 'dBFS threshold used in fixed mode (and as the fallback in auto mode). Default -35.0.'
         required: false
         type: number
         default: -35.0
@@ -127,11 +135,13 @@ jobs:
           INITIAL_PROMPT: ${{ inputs.initial_prompt }}
           TEMPLATE_PATH: ${{ inputs.template_path }}
           DETECTION_MODE: ${{ inputs.detection_mode }}
+          ENERGY_THRESHOLD_MODE: ${{ inputs.energy_threshold_mode }}
           ENERGY_THRESHOLD: ${{ inputs.energy_threshold_db }}
         run: |
           set -euo pipefail
           args=(--audio detect/audio \
                 --detection-mode "$DETECTION_MODE" \
+                --energy-threshold-mode "$ENERGY_THRESHOLD_MODE" \
                 --energy-threshold-db "$ENERGY_THRESHOLD" \
                 --search-text "$SEARCH_TEXT" \
                 --tap-time "$TAP_TIME" --model "$WHISPER_MODEL" \

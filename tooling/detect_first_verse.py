@@ -130,6 +130,15 @@ ENERGY_SMOOTHING_SEC = 1.0
 ENERGY_SUSTAIN_WINDOW_SEC = 2.0
 ENERGY_SUSTAIN_TOLERANCE_DB = 5.0
 
+# Auto-threshold knobs.
+AUTO_BASELINE_WINDOW_SEC = 5.0
+AUTO_THRESHOLD_OFFSET_DB = 20.0
+AUTO_THRESHOLD_MIN_DB = -50.0
+AUTO_THRESHOLD_MAX_DB = -15.0
+# Fallback trigger: baseline window has too many loud frames to be silent.
+AUTO_LOUD_REFERENCE_DB = -40.0
+AUTO_LOUD_FRACTION = 0.2
+
 
 def _energy_envelope(vocals_path: Path,
                      frame_ms: int = ENERGY_FRAME_MS
@@ -206,27 +215,86 @@ def _find_sustained_crossing(times: "np.ndarray",  # type: ignore[name-defined]
     return None
 
 
-def _detect_energy_onset(vocals_path: Path,
-                         threshold_db: float,
-                         window_sec: float,
-                         tolerance_db: float,
-                         tap_time: float) -> tuple[Optional[float], list[dict]]:
-    """Run the energy-onset pipeline and return (onset_sec_or_None, envelope_samples).
-
-    `envelope_samples` is the smoothed dB curve at ENERGY_FRAME_MS resolution,
-    rounded for compact JSON serialisation.
+def _smoothed_envelope(vocals_path: Path
+                       ) -> tuple["np.ndarray", "np.ndarray"]:  # type: ignore[name-defined]
+    """Per-frame smoothed dB envelope (times, db) ready for both threshold
+    selection and onset detection. Same internals as before; split out so
+    the auto-threshold computation can consult the envelope before the
+    crossing search runs.
     """
     times, db = _energy_envelope(vocals_path)
-    smoothing_window = max(1, int(round(ENERGY_SMOOTHING_SEC / (ENERGY_FRAME_MS / 1000.0))))
-    smoothed = _moving_average(db, smoothing_window)
-    onset = _find_sustained_crossing(
-        times, smoothed, threshold_db, window_sec, tolerance_db, tap_time,
+    smoothing_window = max(
+        1, int(round(ENERGY_SMOOTHING_SEC / (ENERGY_FRAME_MS / 1000.0))),
     )
-    envelope = [
+    smoothed = _moving_average(db, smoothing_window)
+    return times, smoothed
+
+
+def _envelope_to_json(times: "np.ndarray",  # type: ignore[name-defined]
+                      smoothed: "np.ndarray"  # type: ignore[name-defined]
+                      ) -> list[dict]:
+    return [
         {"time": round(float(t), 2), "db": round(float(d), 2)}
         for t, d in zip(times, smoothed)
     ]
-    return onset, envelope
+
+
+def _compute_auto_threshold(times: "np.ndarray",  # type: ignore[name-defined]
+                            db: "np.ndarray",  # type: ignore[name-defined]
+                            tap_time: float,
+                            window_sec: float,
+                            offset_db: float,
+                            fallback_db: float) -> dict:
+    """Derive a threshold from the post-tap baseline window. Returns a dict
+    with keys: threshold_db (the value to actually use), baseline_db (median
+    of the baseline window, or None if the window was empty), start, end,
+    loud_count, loud_min, fallback_triggered.
+
+    The baseline assumption is that the audio just after tap is instrumental
+    intro (vocal stem ~ silent). If the baseline window itself has too many
+    loud samples we fall back to fallback_db and flag it.
+    """
+    import numpy as np
+    start = float(tap_time)
+    end = float(tap_time + window_sec)
+    mask = (times >= start) & (times < end)
+    window = db[mask]
+    n = int(len(window))
+    loud_count = int((window > AUTO_LOUD_REFERENCE_DB).sum()) if n > 0 else 0
+    loud_min = max(1, int(round(AUTO_LOUD_FRACTION * n))) if n > 0 else 1
+
+    if n == 0:
+        return {
+            "threshold_db": float(fallback_db),
+            "baseline_db": None,
+            "start": start,
+            "end": end,
+            "loud_count": 0,
+            "loud_min": loud_min,
+            "fallback_triggered": True,
+        }
+    baseline_db = float(np.median(window))
+    if loud_count >= loud_min:
+        return {
+            "threshold_db": float(fallback_db),
+            "baseline_db": baseline_db,
+            "start": start,
+            "end": end,
+            "loud_count": loud_count,
+            "loud_min": loud_min,
+            "fallback_triggered": True,
+        }
+    threshold = max(AUTO_THRESHOLD_MIN_DB,
+                    min(AUTO_THRESHOLD_MAX_DB, baseline_db + offset_db))
+    return {
+        "threshold_db": float(threshold),
+        "baseline_db": baseline_db,
+        "start": start,
+        "end": end,
+        "loud_count": loud_count,
+        "loud_min": loud_min,
+        "fallback_triggered": False,
+    }
 
 
 def _separate_vocals(audio_path: Path) -> tuple[Path, Path, float]:
@@ -395,16 +463,33 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "set, the initial prompt is built automatically from "
                         "the template's lyrics. An explicit --initial-prompt "
                         "takes precedence over this.")
+    p.add_argument("--energy-threshold-mode", choices=["auto", "fixed"],
+                   default="auto",
+                   help="auto (default): derive the threshold from the post-tap "
+                        "baseline window (median + offset, clamped). fixed: "
+                        "use --energy-threshold-db as the absolute threshold.")
     p.add_argument("--energy-threshold-db", type=float, default=-35.0,
-                   help="dBFS threshold for the energy-mode onset detector "
-                        "(default -35.0).")
+                   help="dBFS threshold for fixed mode (and the fallback in "
+                        "auto mode when the baseline window has too much "
+                        "loud audio). Default -35.0.")
+    p.add_argument("--baseline-window-sec", type=float,
+                   default=AUTO_BASELINE_WINDOW_SEC,
+                   help="Length of the post-tap window used to compute the "
+                        "auto-mode baseline (default 5.0). Assumes the song "
+                        "starts with an instrumental intro -- no vocals yet "
+                        "in that window.")
+    p.add_argument("--auto-threshold-offset-db", type=float,
+                   default=AUTO_THRESHOLD_OFFSET_DB,
+                   help="Offset added to the baseline median in auto mode "
+                        f"(default {AUTO_THRESHOLD_OFFSET_DB:.1f}). Clamped to "
+                        f"[{AUTO_THRESHOLD_MIN_DB:.0f}, {AUTO_THRESHOLD_MAX_DB:.0f}] dB.")
     p.add_argument("--energy-sustain-window-sec", type=float,
                    default=ENERGY_SUSTAIN_WINDOW_SEC,
                    help="Length of the post-crossing window whose median dB "
                         "must clear the tolerance line (default 2.0).")
     p.add_argument("--energy-sustain-tolerance-db", type=float,
                    default=ENERGY_SUSTAIN_TOLERANCE_DB,
-                   help="How far below --energy-threshold-db the window "
+                   help="How far below the threshold the post-crossing window "
                         "median is allowed to sit while still counting as "
                         "sustained (default 5.0). Tolerates the brief dips "
                         "between sung syllables.")
@@ -430,19 +515,65 @@ def _run_energy_mode(args: argparse.Namespace) -> int:
     try:
         print(f"Vocal stem isolated, RMS: {vocal_rms_db:.1f} dB", flush=True)
         print("Computing energy envelope...", flush=True)
-        median_floor = args.energy_threshold_db - args.energy_sustain_tolerance_db
+        times, smoothed = _smoothed_envelope(vocals_path)
+
+        auto_info: Optional[dict] = None
+        if args.energy_threshold_mode == "auto":
+            print(
+                f"Computing baseline from {args.tap_time:.1f}s to "
+                f"{args.tap_time + args.baseline_window_sec:.1f}s of vocal stem...",
+                flush=True,
+            )
+            auto_info = _compute_auto_threshold(
+                times, smoothed, args.tap_time, args.baseline_window_sec,
+                args.auto_threshold_offset_db, args.energy_threshold_db,
+            )
+            if auto_info["baseline_db"] is not None:
+                print(
+                    f"Baseline (median) energy: {auto_info['baseline_db']:.1f} dB",
+                    flush=True,
+                )
+            else:
+                print(
+                    "Baseline window contained no samples; falling back to "
+                    "fixed threshold.",
+                    flush=True,
+                )
+            if auto_info["fallback_triggered"]:
+                if auto_info["baseline_db"] is not None:
+                    print(
+                        f"WARNING: baseline window contains loud audio "
+                        f"({auto_info['loud_count']} samples above "
+                        f"{AUTO_LOUD_REFERENCE_DB:.0f} dB). The song may have "
+                        f"no instrumental intro, or tap was placed after "
+                        f"vocals started. Falling back to fixed threshold.",
+                        flush=True,
+                    )
+            else:
+                print(
+                    f"Auto threshold: {auto_info['baseline_db']:.1f} + "
+                    f"{args.auto_threshold_offset_db:.1f} = "
+                    f"{auto_info['threshold_db']:.1f} dB",
+                    flush=True,
+                )
+            threshold_db = auto_info["threshold_db"]
+        else:
+            threshold_db = args.energy_threshold_db
+
+        median_floor = threshold_db - args.energy_sustain_tolerance_db
         print(
-            f"Looking for first crossing of {args.energy_threshold_db:.1f} dB "
+            f"Looking for first crossing of {threshold_db:.1f} dB "
             f"with median energy in next {args.energy_sustain_window_sec:.1f}s "
             f"above {median_floor:.1f} dB",
             flush=True,
         )
-        onset, envelope = _detect_energy_onset(
-            vocals_path, args.energy_threshold_db,
+        onset = _find_sustained_crossing(
+            times, smoothed, threshold_db,
             args.energy_sustain_window_sec,
             args.energy_sustain_tolerance_db,
             args.tap_time,
         )
+        envelope = _envelope_to_json(times, smoothed)
     finally:
         try:
             import shutil  # noqa: PLC0415
@@ -482,13 +613,21 @@ def _run_energy_mode(args: argparse.Namespace) -> int:
             "ground_truth_time": args.ground_truth_time,
             "vocal_separation_used": True,
             "vocal_stem_rms_db": vocal_rms_db,
+            "energy_threshold_mode": args.energy_threshold_mode,
             "energy_threshold_db": args.energy_threshold_db,
+            "computed_threshold_db": threshold_db,
             "energy_smoothing_sec": ENERGY_SMOOTHING_SEC,
             "energy_sustain_window_sec": args.energy_sustain_window_sec,
             "energy_sustain_tolerance_db": args.energy_sustain_tolerance_db,
             "energy_envelope": envelope,
             "detected_onset_sec": onset,
         }
+        if auto_info is not None:
+            report["baseline_window_start_sec"] = auto_info["start"]
+            report["baseline_window_end_sec"] = auto_info["end"]
+            report["baseline_db"] = auto_info["baseline_db"]
+            report["auto_threshold_offset_db"] = args.auto_threshold_offset_db
+            report["baseline_fallback_triggered"] = auto_info["fallback_triggered"]
         if onset_err is not None:
             report["onset_error_sec"] = onset_err
         args.output.parent.mkdir(parents=True, exist_ok=True)

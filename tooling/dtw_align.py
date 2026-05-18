@@ -107,18 +107,87 @@ def _read_chroma_reference(template: dict) -> tuple[np.ndarray, int, int, float]
     return data.T, sr, hop, fps
 
 
-def _section_lookup(template: dict, ref_frame: int) -> Optional[str]:
-    """First section whose [chroma_start_frame, chroma_end_frame) contains
-    ref_frame. Returns None if no section covers it (gap or template-end).
+def _section_lookup(section_map: list[tuple[str, int, int]],
+                    ref_frame: int) -> Optional[str]:
+    """First section in `section_map` whose [chroma_start_frame, chroma_end_frame)
+    contains `ref_frame`. Returns None if no section covers it.
+
+    `section_map` is built once at startup by `_build_section_map` so the
+    DTW per-frame loop doesn't re-walk template["structure"] for every
+    test frame.
     """
-    for section in template.get("structure", []):
-        s = section.get("chroma_start_frame")
-        e = section.get("chroma_end_frame")
-        if s is None or e is None:
-            continue
-        if int(s) <= ref_frame < int(e):
-            return section["section_id"]
+    for sid, s, e in section_map:
+        if s <= ref_frame < e:
+            return sid
     return None
+
+
+def _log_section_bounds(template: dict) -> None:
+    """At startup, dump every section's bounds so the chroma <-> section
+    handoff is visible whether the indices were stamped by
+    chroma_template.py or derived on the fly below.
+    """
+    sections = template.get("structure") or []
+    log.info("Template sections found: %d", len(sections))
+    for s in sections:
+        sid = s.get("section_id", "?")
+        log.info(
+            "  %s: start_time=%s end_time=%s "
+            "chroma_start_frame=%s chroma_end_frame=%s",
+            sid,
+            s.get("start_time"),
+            s.get("end_time"),
+            s.get("chroma_start_frame"),
+            s.get("chroma_end_frame"),
+        )
+        if s.get("chroma_start_frame") is None or s.get("chroma_end_frame") is None:
+            log.warning(
+                "  WARNING: section %s has no chroma frame indices", sid,
+            )
+
+
+def _build_section_map(template: dict,
+                       fps: float
+                       ) -> list[tuple[str, int, int]]:
+    """Build the (section_id, chroma_start_frame, chroma_end_frame) list
+    the per-frame lookup uses.
+
+    Preference order per section:
+      1. Stamped fields (chroma_start_frame / chroma_end_frame).
+      2. Derived from start_time / end_time and the chroma_reference's fps.
+      3. Skip the section -- it can't be mapped to any frame range.
+
+    Logs a one-time WARNING when any section had to use the derived
+    fallback, so the user knows to re-run build-chroma to bake the
+    indices in.
+    """
+    out: list[tuple[str, int, int]] = []
+    fallback_triggered = False
+    for section in template.get("structure") or []:
+        sid = section.get("section_id")
+        if sid is None:
+            continue
+        cs = section.get("chroma_start_frame")
+        ce = section.get("chroma_end_frame")
+        if cs is not None and ce is not None:
+            out.append((sid, int(cs), int(ce)))
+            continue
+        st = section.get("start_time")
+        et = section.get("end_time")
+        if st is not None and et is not None:
+            fallback_triggered = True
+            out.append((
+                sid,
+                int(round(float(st) * fps)),
+                int(round(float(et) * fps)),
+            ))
+    if fallback_triggered:
+        log.warning(
+            "WARNING: at least one section missing chroma_start_frame/"
+            "chroma_end_frame; deriving from start_time/end_time. Re-run "
+            "build-chroma to bake them in.",
+        )
+    return out
 
 
 def _compute_test_chroma(audio_path: Path, sample_rate: int, hop_length: int,
@@ -332,7 +401,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     template = json.loads(args.template.read_text())
+    _log_section_bounds(template)
     ref_chroma, sr, hop_length, fps = _read_chroma_reference(template)
+    section_map = _build_section_map(template, fps)
     n_ref = int(ref_chroma.shape[1])
     log.info(
         "Reference: %d frames at %.1f fps (%.1fs) [sample_rate=%d, hop=%d]",
@@ -367,7 +438,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         ref_frame = int(test_to_ref[i])
         test_time = float(i) / fps + args.song_offset
         ref_time = float(ref_frame) / fps if ref_frame >= 0 else None
-        pred_section = _section_lookup(template, ref_frame) if ref_frame >= 0 else None
+        pred_section = _section_lookup(section_map, ref_frame) if ref_frame >= 0 else None
         gt_sid = _gt_section_at(test_time, gt_intervals) if gt_enabled else None
         rows.append({
             "test_frame": i,

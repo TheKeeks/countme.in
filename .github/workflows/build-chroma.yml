@@ -7,6 +7,10 @@ on:
         description: 'Song id (matches the template basename, e.g. peggy_o)'
         required: true
         type: string
+      audio_url:
+        description: 'Direct download URL for the reference recording (Dropbox ?dl=0 auto-flipped to ?dl=1)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -36,6 +40,28 @@ jobs:
       - name: Install dependencies
         run: pip install -r tooling/requirements.txt
 
+      - name: Download reference audio
+        env:
+          SONG_ID: ${{ inputs.song_id }}
+          AUDIO_URL: ${{ inputs.audio_url }}
+        run: |
+          set -euo pipefail
+          url="$AUDIO_URL"
+          if [[ "$url" == *"dropbox.com"* ]]; then
+            url="${url/?dl=0/?dl=1}"
+            case "$url" in
+              *\?dl=1*) ;;
+              *\?*) url="${url}&dl=1" ;;
+              *) url="${url}?dl=1" ;;
+            esac
+          fi
+          mkdir -p "tooling/references/${SONG_ID}"
+          dest="tooling/references/${SONG_ID}/reference_audio"
+          echo "Downloading reference audio from: $url"
+          # No extension on purpose: librosa+ffmpeg sniff the container.
+          curl -L --fail --max-time 600 -o "$dest" "$url"
+          ls -la "$dest"
+
       - name: Compute chroma reference
         env:
           SONG_ID: ${{ inputs.song_id }}
@@ -46,7 +72,9 @@ jobs:
             echo "::error::Template not found: $template"
             exit 1
           fi
-          python tooling/chroma_template.py --template "$template"
+          python tooling/chroma_template.py \
+            --template "$template" \
+            --audio "tooling/references/${SONG_ID}/reference_audio"
           ls -la "$template"
 
       - name: Commit updated template

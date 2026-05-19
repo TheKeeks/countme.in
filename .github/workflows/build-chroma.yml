@@ -7,10 +7,11 @@ on:
         description: 'Song id (matches the template basename, e.g. peggy_o)'
         required: true
         type: string
-      audio_url:
-        description: 'Direct download URL for the reference recording (Dropbox ?dl=0 auto-flipped to ?dl=1)'
-        required: true
+      audio_url_override:
+        description: 'Optional reference audio URL. Defaults to template.validation_targets.studio_reference.audio_url. Required when the template has no validation_targets.'
+        required: false
         type: string
+        default: ''
 
 permissions:
   contents: write
@@ -40,10 +41,46 @@ jobs:
       - name: Install dependencies
         run: pip install -r tooling/requirements.txt
 
+      - name: Resolve reference audio URL
+        id: target
+        env:
+          SONG_ID: ${{ inputs.song_id }}
+          AUDIO_URL_OVERRIDE: ${{ inputs.audio_url_override }}
+        run: |
+          set -euo pipefail
+          template="tooling/songs/${SONG_ID}_aligned.json"
+          if [[ ! -f "$template" ]]; then
+            echo "::error::Template not found: $template"
+            exit 1
+          fi
+          # Resolve from validation_targets.studio_reference.audio_url unless
+          # the user supplied audio_url_override. Backward-compat: templates
+          # with no validation_targets force the user to supply the override.
+          python - <<'PY'
+          import json, os, sys
+          template_path = f"tooling/songs/{os.environ['SONG_ID']}_aligned.json"
+          override = (os.environ.get("AUDIO_URL_OVERRIDE") or "").strip()
+          t = json.loads(open(template_path).read())
+          vts = t.get("validation_targets") or {}
+          vt = vts.get("studio_reference") or {}
+          audio_url = override or vt.get("audio_url") or ""
+          if not audio_url:
+              sys.stderr.write(
+                  "::error::Template has no validation_targets.studio_reference.audio_url. "
+                  "Provide audio_url_override on this run.\n",
+              )
+              sys.exit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"audio_url={audio_url}\n")
+          print(f"resolved audio_url = {audio_url}")
+          if override:
+              print("(overridden from input)")
+          PY
+
       - name: Download reference audio
         env:
           SONG_ID: ${{ inputs.song_id }}
-          AUDIO_URL: ${{ inputs.audio_url }}
+          AUDIO_URL: ${{ steps.target.outputs.audio_url }}
         run: |
           set -euo pipefail
           url="$AUDIO_URL"

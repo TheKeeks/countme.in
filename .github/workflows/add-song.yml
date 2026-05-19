@@ -191,6 +191,60 @@ jobs:
             --out "$TEMPLATE_PATH" \
             -v
 
+      - name: Stamp validation_targets on template
+        if: ${{ steps.build.outcome == 'success' }}
+        env:
+          SONG_SLUG: ${{ steps.slug.outputs.song_slug }}
+          OUT_DIR: ${{ steps.slug.outputs.out_dir }}
+          TEMPLATE_PATH: ${{ steps.slug.outputs.template_path }}
+        run: |
+          set -euo pipefail
+          # Pull the original_url of the first downloaded reference from
+          # fetch_references' manifest.json, write a validation_targets
+          # block onto the template so chroma / DTW workflows can default
+          # their inputs from this song's template.
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          slug = os.environ["SONG_SLUG"]
+          out_dir = Path(os.environ["OUT_DIR"])
+          template_path = Path(os.environ["TEMPLATE_PATH"])
+          manifest = out_dir / "manifest.json"
+          studio_audio_url = None
+          if manifest.exists():
+              try:
+                  entries = json.loads(manifest.read_text())
+                  if entries:
+                      studio_audio_url = entries[0].get("original_url")
+              except (json.JSONDecodeError, OSError):
+                  studio_audio_url = None
+          template = json.loads(template_path.read_text())
+          template["validation_targets"] = {
+              "studio_reference": {
+                  "audio_url": studio_audio_url,
+                  "ground_truth_path": f"tooling/ground_truth/{slug}.json",
+                  "song_offset_sec": 0.0,
+                  "description": (
+                      "Self-validation against the reference recording the "
+                      "template was built from"
+                  ),
+              },
+              "band_recording": {
+                  "audio_url": None,
+                  "ground_truth_path": f"tooling/ground_truth/{slug}_band.json",
+                  "song_offset_sec": 20.0,
+                  "description": (
+                      "Band rehearsal recording -- audio_url provided per "
+                      "run via audio_url_override"
+                  ),
+              },
+          }
+          template_path.write_text(json.dumps(template, indent=2))
+          print(f"stamped validation_targets onto {template_path}")
+          print(f"  studio_reference.audio_url = {studio_audio_url}")
+          print(f"  band_recording.audio_url   = null (fill in via override)")
+          PY
+
       - name: Upload template artifact
         if: ${{ steps.build.outcome == 'success' }}
         uses: actions/upload-artifact@v4

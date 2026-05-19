@@ -3,24 +3,23 @@ name: DTW align
 on:
   workflow_dispatch:
     inputs:
-      audio_url:
-        description: 'Direct download URL for the test audio (Dropbox ?dl=0 auto-flipped to ?dl=1)'
-        required: true
-        type: string
       song_id:
         description: 'Song id (template at tooling/songs/<song_id>_aligned.json)'
         required: true
         type: string
-      ground_truth_path:
-        description: 'Optional repo-relative path to a ground-truth JSON, e.g. tooling/ground_truth/peggy_o.json'
+      validation_target:
+        description: 'Which entry in template.validation_targets to use'
+        required: false
+        type: choice
+        default: studio_reference
+        options:
+          - studio_reference
+          - band_recording
+      audio_url_override:
+        description: 'Optional audio_url to use instead of the one in the template (required when the target has audio_url=null)'
         required: false
         type: string
         default: ''
-      song_offset:
-        description: 'Seconds of pre-song audio to skip on the test side before DTW (default 0.0)'
-        required: false
-        type: number
-        default: 0.0
 
 permissions:
   contents: read
@@ -48,9 +47,57 @@ jobs:
       - name: Install dependencies
         run: pip install -r tooling/requirements.txt
 
+      - name: Resolve validation target
+        id: target
+        env:
+          SONG_ID: ${{ inputs.song_id }}
+          VALIDATION_TARGET: ${{ inputs.validation_target }}
+          AUDIO_URL_OVERRIDE: ${{ inputs.audio_url_override }}
+        run: |
+          set -euo pipefail
+          template="tooling/songs/${SONG_ID}_aligned.json"
+          if [[ ! -f "$template" ]]; then
+            echo "::error::Template not found: $template"
+            exit 1
+          fi
+          # Read validation_targets[<target>]; audio_url_override beats the
+          # template's audio_url. Defaults (when validation_targets missing):
+          # gt at tooling/ground_truth/<song_id>.json, song_offset 0.0.
+          python - <<'PY'
+          import json, os, sys
+          template_path = f"tooling/songs/{os.environ['SONG_ID']}_aligned.json"
+          target = os.environ["VALIDATION_TARGET"]
+          override = (os.environ.get("AUDIO_URL_OVERRIDE") or "").strip()
+          t = json.loads(open(template_path).read())
+          vts = t.get("validation_targets") or {}
+          vt = vts.get(target) or {}
+          audio_url = override or vt.get("audio_url") or ""
+          gt = vt.get("ground_truth_path") or f"tooling/ground_truth/{os.environ['SONG_ID']}.json"
+          offset = vt.get("song_offset_sec")
+          if offset is None:
+              offset = 0.0
+          if not audio_url:
+              sys.stderr.write(
+                  f"::error::validation_target '{target}' has no audio_url. "
+                  f"Provide audio_url_override or update the template.\n",
+              )
+              sys.exit(1)
+          out_path = os.environ["GITHUB_OUTPUT"]
+          with open(out_path, "a") as f:
+              f.write(f"audio_url={audio_url}\n")
+              f.write(f"ground_truth_path={gt}\n")
+              f.write(f"song_offset={offset}\n")
+          print(f"resolved target={target}")
+          print(f"  audio_url         = {audio_url}")
+          print(f"  ground_truth_path = {gt}")
+          print(f"  song_offset_sec   = {offset}")
+          if override:
+              print(f"  (audio_url overridden from input)")
+          PY
+
       - name: Download audio
         env:
-          AUDIO_URL: ${{ inputs.audio_url }}
+          AUDIO_URL: ${{ steps.target.outputs.audio_url }}
         run: |
           set -euo pipefail
           url="$AUDIO_URL"
@@ -71,15 +118,11 @@ jobs:
       - name: Run DTW alignment
         env:
           SONG_ID: ${{ inputs.song_id }}
-          GT_PATH: ${{ inputs.ground_truth_path }}
-          SONG_OFFSET: ${{ inputs.song_offset }}
+          GT_PATH: ${{ steps.target.outputs.ground_truth_path }}
+          SONG_OFFSET: ${{ steps.target.outputs.song_offset }}
         run: |
           set -euo pipefail
           template="tooling/songs/${SONG_ID}_aligned.json"
-          if [[ ! -f "$template" ]]; then
-            echo "::error::Template not found: $template"
-            exit 1
-          fi
           args=(--template "$template" --audio dtw/audio \
                 --song-offset "$SONG_OFFSET" \
                 --output-md dtw/validation.md \
@@ -87,10 +130,10 @@ jobs:
                 -v)
           if [[ -n "${GT_PATH:-}" ]]; then
             if [[ ! -f "$GT_PATH" ]]; then
-              echo "::error::Ground truth not found: $GT_PATH"
-              exit 1
+              echo "::warning::Ground truth not found at $GT_PATH; running without accuracy."
+            else
+              args+=(--ground-truth "$GT_PATH")
             fi
-            args+=(--ground-truth "$GT_PATH")
           fi
           python tooling/dtw_align.py "${args[@]}"
           ls -la dtw/
@@ -107,7 +150,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dtw-${{ inputs.song_id }}
+          name: dtw-${{ inputs.song_id }}-${{ inputs.validation_target }}
           path: |
             dtw/validation.md
             dtw/validation.json

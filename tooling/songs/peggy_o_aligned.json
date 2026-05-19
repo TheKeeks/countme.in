@@ -66930,5 +66930,19 @@
         1.0
       ]
     ]
+  },
+  "validation_targets": {
+    "studio_reference": {
+      "audio_url": "https://archive.org/download/gd78-05-10.sbd.lai.3899.sbefail.shnf/gd78-05-10d1t107.mp3",
+      "ground_truth_path": "tooling/ground_truth/peggy_o.json",
+      "song_offset_sec": 0.0,
+      "description": "Self-validation against the Dick's Picks 25 (5/10/78) reference the template was built from"
+    },
+    "band_recording": {
+      "audio_url": null,
+      "ground_truth_path": "tooling/ground_truth/peggy_o_band.json",
+      "song_offset_sec": 20.0,
+      "description": "Band rehearsal recording -- audio_url provided per run via audio_url_override"
+    }
   }
 }

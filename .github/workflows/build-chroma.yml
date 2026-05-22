@@ -12,6 +12,11 @@ on:
         required: false
         type: string
         default: ''
+      ground_truth_path:
+        description: 'Ground-truth JSON path; defaults to tooling/ground_truth/<song_id>.json'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -102,6 +107,7 @@ jobs:
       - name: Compute chroma reference
         env:
           SONG_ID: ${{ inputs.song_id }}
+          GT_OVERRIDE: ${{ inputs.ground_truth_path }}
         run: |
           set -euo pipefail
           template="tooling/songs/${SONG_ID}_aligned.json"
@@ -109,8 +115,14 @@ jobs:
             echo "::error::Template not found: $template"
             exit 1
           fi
+          gt="${GT_OVERRIDE:-tooling/ground_truth/${SONG_ID}.json}"
+          if [[ ! -f "$gt" ]]; then
+            echo "::error::Ground-truth file not found: $gt"
+            exit 1
+          fi
           python tooling/chroma_template.py \
             --template "$template" \
+            --ground-truth "$gt" \
             --audio "tooling/references/${SONG_ID}/reference_audio"
           ls -la "$template"
 

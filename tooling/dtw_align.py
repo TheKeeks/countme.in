@@ -32,6 +32,11 @@ from typing import Optional
 import librosa
 import numpy as np
 
+# detect_first_verse owns vocal-isolation + energy onset detection. We import
+# its private helpers rather than reimplementing -- single source of truth.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import detect_first_verse as dfv  # noqa: E402
+
 
 log = logging.getLogger("dtw_align")
 
@@ -255,6 +260,198 @@ def _test_to_ref_mapping(wp: np.ndarray, n_test: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Re-anchoring via vocal-onset detection
+# ---------------------------------------------------------------------------
+
+REANCHOR_SEARCH_WINDOW_SEC = 45.0
+REANCHOR_FALLBACK_THRESHOLD_DB = -35.0
+
+
+def _dtw_guess_test_time(test_to_ref: np.ndarray, target_ref_frame: int,
+                         fps: float, song_offset: float) -> Optional[float]:
+    """Where does the single-pass DTW currently *think* `target_ref_frame`
+    happens in the test audio? Returns the absolute test time (seconds) of
+    the first test frame whose mapping crosses target_ref_frame, or None
+    when DTW never reaches it.
+    """
+    for i, rf in enumerate(test_to_ref):
+        if rf >= target_ref_frame:
+            return float(i) / fps + song_offset
+    return None
+
+
+def _detect_reanchor_onsets(audio_path: Path,
+                            sections_to_anchor: list[str],
+                            template_sections: list[dict],
+                            test_to_ref: np.ndarray,
+                            fps: float,
+                            song_offset: float) -> tuple[list[tuple[str, float, float]], dict]:
+    """For each named section, find a vocal onset in the test audio within
+    ±REANCHOR_SEARCH_WINDOW_SEC of DTW's current guess for that section.
+
+    Reuses tooling/detect_first_verse: Demucs runs once, the smoothed
+    envelope is computed once, and the auto-threshold is calibrated from
+    a single baseline window so all anchor searches share consistent
+    sensitivity.
+
+    Returns (anchors, info) where:
+      anchors: list of (section_id, ref_start_sec, detected_test_sec)
+               for sections where detection succeeded
+      info: per-section dict including search window, detected onset,
+            and reason on failure -- for the report.
+    """
+    section_starts = {
+        s["section_id"]: s.get("start_time")
+        for s in template_sections
+    }
+
+    info: dict = {"per_section": [], "demucs_used": True,
+                  "threshold_db": None, "baseline_db": None,
+                  "fallback_triggered": False, "vocal_rms_db": None}
+
+    log.info("Re-anchor: isolating vocals via Demucs ...")
+    vocals_path, demucs_dir, vocal_rms_db = dfv._separate_vocals(audio_path)
+    info["vocal_rms_db"] = round(vocal_rms_db, 2)
+    log.info("Re-anchor: vocal stem RMS %.1f dB", vocal_rms_db)
+    try:
+        times, smoothed = dfv._smoothed_envelope(vocals_path)
+        auto = dfv._compute_auto_threshold(
+            times, smoothed,
+            tap_time=song_offset,
+            window_sec=dfv.AUTO_BASELINE_WINDOW_SEC,
+            offset_db=dfv.AUTO_THRESHOLD_OFFSET_DB,
+            fallback_db=REANCHOR_FALLBACK_THRESHOLD_DB,
+        )
+        threshold_db = float(auto["threshold_db"])
+        info["threshold_db"] = round(threshold_db, 2)
+        info["baseline_db"] = (
+            round(float(auto["baseline_db"]), 2)
+            if auto.get("baseline_db") is not None else None
+        )
+        info["fallback_triggered"] = bool(auto["fallback_triggered"])
+        log.info(
+            "Re-anchor threshold: %.1f dB (baseline %s, fallback=%s)",
+            threshold_db,
+            f"{auto['baseline_db']:.1f}" if auto.get("baseline_db") is not None else "n/a",
+            auto["fallback_triggered"],
+        )
+
+        anchors: list[tuple[str, float, float]] = []
+        for sid in sections_to_anchor:
+            ref_start = section_starts.get(sid)
+            entry: dict = {"section_id": sid, "ref_start_sec": ref_start}
+            if ref_start is None:
+                entry["reason"] = "section has no start_time in template"
+                log.warning("Re-anchor: %s missing start_time; skipping", sid)
+                info["per_section"].append(entry)
+                continue
+            target_ref_frame = int(round(float(ref_start) * fps))
+            t_guess = _dtw_guess_test_time(test_to_ref, target_ref_frame, fps, song_offset)
+            entry["dtw_guess_sec"] = round(t_guess, 2) if t_guess is not None else None
+            if t_guess is None:
+                entry["reason"] = "DTW never reached the section in single-pass"
+                log.warning("Re-anchor: no DTW guess for %s; skipping", sid)
+                info["per_section"].append(entry)
+                continue
+
+            search_lo = max(song_offset, t_guess - REANCHOR_SEARCH_WINDOW_SEC)
+            search_hi = t_guess + REANCHOR_SEARCH_WINDOW_SEC
+            entry["search_window_sec"] = [round(search_lo, 2), round(search_hi, 2)]
+            mask = (times >= search_lo) & (times < search_hi)
+            sub_times = times[mask]
+            sub_db = smoothed[mask]
+            if len(sub_times) == 0:
+                entry["reason"] = "envelope has no samples in search window"
+                log.warning("Re-anchor: empty envelope window for %s", sid)
+                info["per_section"].append(entry)
+                continue
+            onset = dfv._find_sustained_crossing(
+                sub_times, sub_db, threshold_db,
+                dfv.ENERGY_SUSTAIN_WINDOW_SEC,
+                dfv.ENERGY_SUSTAIN_TOLERANCE_DB,
+                tap_time=search_lo,
+            )
+            if onset is None:
+                entry["reason"] = (
+                    f"no vocal onset above {threshold_db:.1f} dB sustained for "
+                    f"{dfv.ENERGY_SUSTAIN_WINDOW_SEC:.1f}s in window"
+                )
+                log.warning(
+                    "Re-anchor: no vocal onset for %s in [%.1f, %.1f]s; "
+                    "falling back to single-pass at this boundary",
+                    sid, search_lo, search_hi,
+                )
+                info["per_section"].append(entry)
+                continue
+            entry["detected_onset_sec"] = round(float(onset), 2)
+            log.info(
+                "Re-anchor: %s detected test onset %.2fs -> reference %.1fs",
+                sid, onset, ref_start,
+            )
+            anchors.append((sid, float(ref_start), float(onset)))
+            info["per_section"].append(entry)
+    finally:
+        import shutil  # noqa: PLC0415
+        shutil.rmtree(demucs_dir, ignore_errors=True)
+
+    return anchors, info
+
+
+def _segmented_dtw(test_chroma: np.ndarray, ref_chroma: np.ndarray,
+                   anchors: list[tuple[str, float, float]],
+                   fps: float, song_offset: float
+                   ) -> tuple[np.ndarray, list[dict]]:
+    """Run DTW once per segment defined by the anchors. Returns the
+    concatenated forward warping path plus a list of segment-info dicts
+    for the report. Anchor frame indices are clamped to the available
+    range and dedupe'd to keep segments strictly monotone.
+
+    Frame indices in the returned path are relative to the start of
+    test_chroma (frame 0 = song_offset wall-clock), same convention as
+    single-pass output.
+    """
+    n_test = int(test_chroma.shape[1])
+    n_ref = int(ref_chroma.shape[1])
+    boundaries: list[tuple[int, int]] = [(0, 0)]
+    for _sid, ref_t, test_t in sorted(anchors, key=lambda x: x[2]):
+        tf = int(round((test_t - song_offset) * fps))
+        rf = int(round(ref_t * fps))
+        tf = max(0, min(tf, n_test))
+        rf = max(0, min(rf, n_ref))
+        if tf > boundaries[-1][0] and rf > boundaries[-1][1]:
+            boundaries.append((tf, rf))
+        else:
+            log.warning(
+                "Re-anchor: skipping non-monotone anchor (test_frame=%d, ref_frame=%d) "
+                "after previous (%d, %d)",
+                tf, rf, boundaries[-1][0], boundaries[-1][1],
+            )
+    if boundaries[-1] != (n_test, n_ref):
+        boundaries.append((n_test, n_ref))
+
+    full_wp_parts: list[np.ndarray] = []
+    segments: list[dict] = []
+    for (t_lo, r_lo), (t_hi, r_hi) in zip(boundaries, boundaries[1:]):
+        if t_hi <= t_lo or r_hi <= r_lo:
+            continue
+        sub_test = test_chroma[:, t_lo:t_hi]
+        sub_ref = ref_chroma[:, r_lo:r_hi]
+        sub_wp = _run_dtw(sub_test, sub_ref)
+        sub_wp_abs = sub_wp + np.array([t_lo, r_lo], dtype=np.int64)
+        full_wp_parts.append(sub_wp_abs)
+        segments.append({
+            "test_frames": [int(t_lo), int(t_hi)],
+            "ref_frames": [int(r_lo), int(r_hi)],
+            "test_sec": [round(t_lo / fps + song_offset, 2),
+                         round(t_hi / fps + song_offset, 2)],
+            "ref_sec": [round(r_lo / fps, 2), round(r_hi / fps, 2)],
+        })
+    if not full_wp_parts:
+        return np.zeros((0, 2), dtype=np.int64), segments
+    return np.concatenate(full_wp_parts, axis=0), segments
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
@@ -331,7 +528,8 @@ def _build_report(template: dict, audio_path: Path,
                   chroma_meta: dict,
                   rows: list[dict],
                   song_offset: float,
-                  gt_enabled: bool) -> tuple[str, dict]:
+                  gt_enabled: bool,
+                  reanchor_info: Optional[dict] = None) -> tuple[str, dict]:
     by_section = Counter(r["predicted_section"] for r in rows)
     n = len(rows)
 
@@ -346,6 +544,41 @@ def _build_report(template: dict, audio_path: Path,
         f"- Reference frames: {chroma_meta['n_ref_frames']}",
         f"- Song offset: {song_offset:.1f}s",
     ]
+
+    if reanchor_info is not None:
+        requested = [e["section_id"] for e in reanchor_info.get("per_section", [])]
+        anchors = reanchor_info.get("anchors", [])
+        segments = reanchor_info.get("segments", [])
+        out += ["", "## Re-anchoring", ""]
+        out.append(f"- Re-anchor sections: {', '.join(requested) or '(none)'}")
+        if anchors:
+            for a in anchors:
+                out.append(
+                    f"  - `{a['section_id']}`: detected test onset "
+                    f"{a['detected_test_sec']}s → anchored to reference "
+                    f"{a['ref_start_sec']}s"
+                )
+        # Note any sections that failed onset detection (no entry in `anchors`).
+        anchored_ids = {a["section_id"] for a in anchors}
+        for entry in reanchor_info.get("per_section", []):
+            if entry["section_id"] not in anchored_ids:
+                reason = entry.get("reason", "unknown")
+                out.append(
+                    f"  - `{entry['section_id']}`: re-anchor failed "
+                    f"({reason}); fell back to single-pass for this boundary"
+                )
+        if segments:
+            out.append(
+                f"- Segmented DTW: {len(segments)} segment(s)"
+            )
+            for i, seg in enumerate(segments):
+                out.append(
+                    f"  - segment {i}: test {seg['test_sec'][0]}–"
+                    f"{seg['test_sec'][1]}s → ref {seg['ref_sec'][0]}–"
+                    f"{seg['ref_sec'][1]}s "
+                    f"({seg['test_frames'][1]-seg['test_frames'][0]} test, "
+                    f"{seg['ref_frames'][1]-seg['ref_frames'][0]} ref frames)"
+                )
 
     stats: dict = {}
     accuracy_stats: Optional[dict] = None
@@ -384,6 +617,8 @@ def _build_report(template: dict, audio_path: Path,
     }
     if accuracy_stats is not None:
         report_json["accuracy"] = accuracy_stats
+    if reanchor_info is not None:
+        report_json["reanchor"] = reanchor_info
     return "\n".join(out) + "\n", report_json
 
 
@@ -401,6 +636,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "before computing chroma (default 0.0).")
     p.add_argument("--output-md", type=Path, default=Path("dtw_validation.md"))
     p.add_argument("--output-json", type=Path, default=Path("dtw_validation.json"))
+    p.add_argument("--reanchor-sections", default="",
+                   help="Comma-separated section_ids to use as hard re-anchor "
+                        "points via vocal-onset detection (e.g. 'verse_5'). "
+                        "Each becomes a boundary at which the test audio is "
+                        "split and DTW is run independently per segment. "
+                        "Empty (default) keeps single-pass DTW behaviour.")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -433,6 +674,39 @@ def main(argv: Optional[list[str]] = None) -> int:
     log.info("Running DTW...")
     wp = _run_dtw(test_chroma, ref_chroma)
     test_to_ref = _test_to_ref_mapping(wp, n_test)
+
+    # Optional re-anchoring: detect vocal onsets at named sections, then
+    # rerun DTW segment-by-segment so a per-section duration mismatch
+    # (e.g. a band jam that's much shorter than the studio reference)
+    # can't drag every subsequent section out of alignment.
+    sections_to_anchor = [s.strip() for s in args.reanchor_sections.split(",") if s.strip()]
+    reanchor_info: Optional[dict] = None
+    segments_info: list[dict] = []
+    if sections_to_anchor:
+        log.info("Re-anchor: requested sections = %s", sections_to_anchor)
+        anchors, reanchor_info = _detect_reanchor_onsets(
+            args.audio,
+            sections_to_anchor,
+            template.get("structure") or [],
+            test_to_ref, fps, args.song_offset,
+        )
+        if anchors:
+            log.info("Re-anchor: %d anchor(s) found; running segmented DTW",
+                     len(anchors))
+            wp, segments_info = _segmented_dtw(
+                test_chroma, ref_chroma, anchors, fps, args.song_offset,
+            )
+            test_to_ref = _test_to_ref_mapping(wp, n_test)
+            log.info("Re-anchor: %d segment(s) aligned independently",
+                     len(segments_info))
+        else:
+            log.warning("Re-anchor: no usable anchors; keeping single-pass DTW")
+        reanchor_info["anchors"] = [
+            {"section_id": sid, "ref_start_sec": round(rt, 2),
+             "detected_test_sec": round(tt, 2)}
+            for sid, rt, tt in anchors
+        ]
+        reanchor_info["segments"] = segments_info
 
     # Ground truth (optional). Errors loudly when --ground-truth was given
     # but the file doesn't exist; otherwise downstream gt_section_id values
@@ -479,6 +753,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     md_text, report_json = _build_report(
         template, args.audio, chroma_meta, rows, args.song_offset, gt_enabled,
+        reanchor_info=reanchor_info,
     )
 
     args.output_md.parent.mkdir(parents=True, exist_ok=True)

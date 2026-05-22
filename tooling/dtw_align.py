@@ -64,8 +64,17 @@ def _load_ground_truth(path: Path) -> list[tuple[str, float, float]]:
 
 
 def _gt_section_at(t: float, gt: list[tuple[str, float, float]]) -> Optional[str]:
+    """Return the GT section_id whose [start, end) contains t, or None.
+
+    Underscore-prefixed sections ('_silence', '_noodling' on band recordings,
+    etc.) are intentionally returned as None so they surface in the JSON as
+    gt_section_id=null and drop out of accuracy. The 'excluded' count in
+    the report is the difference between rows and rows-with-non-null GT.
+    """
     for sid, gs, ge in gt:
         if gs <= t < ge:
+            if sid.startswith("_"):
+                return None
             return sid
     return None
 
@@ -425,13 +434,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     wp = _run_dtw(test_chroma, ref_chroma)
     test_to_ref = _test_to_ref_mapping(wp, n_test)
 
-    # Ground truth (optional)
+    # Ground truth (optional). Errors loudly when --ground-truth was given
+    # but the file doesn't exist; otherwise downstream gt_section_id values
+    # would silently be null and the user would think the workflow worked.
     gt_intervals: list[tuple[str, float, float]] = []
     gt_enabled = args.ground_truth is not None
     if gt_enabled:
+        if not args.ground_truth.exists():
+            log.error("ERROR: ground truth file not found: %s", args.ground_truth)
+            return 1
         gt_intervals = _load_ground_truth(args.ground_truth)
-        log.info("Loaded %d ground-truth intervals from %s",
-                 len(gt_intervals), args.ground_truth)
+        n_excluded = sum(1 for sid, _, _ in gt_intervals if sid.startswith("_"))
+        log.info(
+            "Ground truth: %s (%d sections, %d excluded)",
+            args.ground_truth, len(gt_intervals), n_excluded,
+        )
+    else:
+        log.info("Ground truth: none provided")
 
     rows: list[dict] = []
     for i in range(n_test):

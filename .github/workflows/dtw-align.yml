@@ -128,12 +128,10 @@ jobs:
                 --output-md dtw/validation.md \
                 --output-json dtw/validation.json \
                 -v)
+          # Always pass --ground-truth when the resolver produced a path.
+          # dtw_align validates existence and errors clearly if it's missing.
           if [[ -n "${GT_PATH:-}" ]]; then
-            if [[ ! -f "$GT_PATH" ]]; then
-              echo "::warning::Ground truth not found at $GT_PATH; running without accuracy."
-            else
-              args+=(--ground-truth "$GT_PATH")
-            fi
+            args+=(--ground-truth "$GT_PATH")
           fi
           python tooling/dtw_align.py "${args[@]}"
           ls -la dtw/

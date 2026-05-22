@@ -1109,7 +1109,11 @@
         40.0
       ],
       "lines": [],
-      "notes": "instrumental, settles into the groove before verse 1"
+      "notes": "instrumental, settles into the groove before verse 1",
+      "start_time": 0.0,
+      "end_time": 53.0,
+      "chroma_start_frame": 0,
+      "chroma_end_frame": 530
     },
     {
       "section_id": "verse_1",
@@ -1212,7 +1216,11 @@
           "interpolated": false
         }
       ],
-      "notes": ""
+      "notes": "",
+      "start_time": 53.0,
+      "end_time": 85.0,
+      "chroma_start_frame": 530,
+      "chroma_end_frame": 850
     },
     {
       "section_id": "verse_2",
@@ -1315,7 +1323,11 @@
           "interpolated": false
         }
       ],
-      "notes": ""
+      "notes": "",
+      "start_time": 85.0,
+      "end_time": 117.0,
+      "chroma_start_frame": 850,
+      "chroma_end_frame": 1170
     },
     {
       "section_id": "verse_3",
@@ -1418,7 +1430,11 @@
           "interpolated": false
         }
       ],
-      "notes": ""
+      "notes": "",
+      "start_time": 117.0,
+      "end_time": 148.0,
+      "chroma_start_frame": 1170,
+      "chroma_end_frame": 1480
     },
     {
       "section_id": "verse_4",
@@ -1521,7 +1537,11 @@
           "interpolated": false
         }
       ],
-      "notes": ""
+      "notes": "",
+      "start_time": 148.0,
+      "end_time": 181.0,
+      "chroma_start_frame": 1480,
+      "chroma_end_frame": 1810
     },
     {
       "section_id": "jam_1",
@@ -1534,7 +1554,11 @@
         300.0
       ],
       "lines": [],
-      "notes": "instrumental solo -- length varies between shows"
+      "notes": "instrumental solo -- length varies between shows",
+      "start_time": 181.0,
+      "end_time": 311.0,
+      "chroma_start_frame": 1810,
+      "chroma_end_frame": 3110
     },
     {
       "section_id": "verse_5",
@@ -1637,7 +1661,11 @@
           "interpolated": false
         }
       ],
-      "notes": ""
+      "notes": "",
+      "start_time": 311.0,
+      "end_time": 350.0,
+      "chroma_start_frame": 3110,
+      "chroma_end_frame": 3500
     },
     {
       "section_id": "verse_6",
@@ -1740,7 +1768,11 @@
           "interpolated": false
         }
       ],
-      "notes": ""
+      "notes": "",
+      "start_time": 350.0,
+      "end_time": 382.0,
+      "chroma_start_frame": 3500,
+      "chroma_end_frame": 3820
     },
     {
       "section_id": "verse_7",
@@ -1843,7 +1875,11 @@
           "interpolated": false
         }
       ],
-      "notes": ""
+      "notes": "",
+      "start_time": 382.0,
+      "end_time": 415.0,
+      "chroma_start_frame": 3820,
+      "chroma_end_frame": 4150
     },
     {
       "section_id": "verse_8",
@@ -1946,7 +1982,11 @@
           "interpolated": false
         }
       ],
-      "notes": ""
+      "notes": "",
+      "start_time": 415.0,
+      "end_time": 444.0,
+      "chroma_start_frame": 4150,
+      "chroma_end_frame": 4440
     },
     {
       "section_id": "outro_1",
@@ -1959,7 +1999,11 @@
         30.0
       ],
       "lines": [],
-      "notes": "final phrase, tag, ritard"
+      "notes": "final phrase, tag, ritard",
+      "start_time": 444.0,
+      "end_time": 455.0,
+      "chroma_start_frame": 4440,
+      "chroma_end_frame": 4550
     }
   ],
   "chroma_reference": {

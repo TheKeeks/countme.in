@@ -20,6 +20,11 @@ on:
         required: false
         type: string
         default: ''
+      reanchor_sections:
+        description: 'Optional comma-separated section_ids to use as hard re-anchor points via vocal-onset detection (e.g. "verse_5"). Empty = single-pass DTW.'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -120,6 +125,7 @@ jobs:
           SONG_ID: ${{ inputs.song_id }}
           GT_PATH: ${{ steps.target.outputs.ground_truth_path }}
           SONG_OFFSET: ${{ steps.target.outputs.song_offset }}
+          REANCHOR_SECTIONS: ${{ inputs.reanchor_sections }}
         run: |
           set -euo pipefail
           template="tooling/songs/${SONG_ID}_aligned.json"
@@ -132,6 +138,9 @@ jobs:
           # dtw_align validates existence and errors clearly if it's missing.
           if [[ -n "${GT_PATH:-}" ]]; then
             args+=(--ground-truth "$GT_PATH")
+          fi
+          if [[ -n "${REANCHOR_SECTIONS:-}" ]]; then
+            args+=(--reanchor-sections "$REANCHOR_SECTIONS")
           fi
           python tooling/dtw_align.py "${args[@]}"
           ls -la dtw/

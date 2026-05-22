@@ -15,7 +15,14 @@ MERT fields stay put during the transition.
 CLI:
     python tooling/chroma_template.py \\
         --template tooling/songs/peggy_o_aligned.json \\
+        --ground-truth tooling/ground_truth/peggy_o.json \\
         [--audio path/to/reference.mp3]
+
+The ground-truth file is the source of truth for section start/end times.
+build_song.py-built templates already carry start_time/end_time on every
+section, but legacy templates built by template_builder.py + alignment.py
+only have start_sec/end_sec on the vocal sections (intro / jam / outro
+have nothing). Stamping from GT here makes both kinds work.
 """
 
 from __future__ import annotations
@@ -87,24 +94,54 @@ def compute_chroma(audio_path: Path,
     return chroma.T.astype(np.float32), sr, hop_length, fps
 
 
-def stamp_section_frames(template: dict, sample_rate: int,
-                         hop_length: int) -> int:
-    """Attach chroma_start_frame / chroma_end_frame to each section based
-    on its start_time / end_time. Returns the number of sections stamped.
+def _load_ground_truth_bounds(path: Path) -> dict[str, tuple[float, float]]:
+    """Read a ground-truth JSON and return {section_id: (start, end)} for
+    every non-excluded section. Underscore-prefixed sections ('_silence'
+    and friends) are kept here -- the caller decides whether to match them
+    against the template's structure.
+    """
+    data = json.loads(path.read_text())
+    out: dict[str, tuple[float, float]] = {}
+    for s in data.get("sections", []):
+        sid = s.get("section_id")
+        if sid is None or "start" not in s or "end" not in s:
+            continue
+        out[sid] = (float(s["start"]), float(s["end"]))
+    return out
+
+
+def stamp_section_bounds(template: dict, gt_bounds: dict[str, tuple[float, float]],
+                         sample_rate: int, hop_length: int
+                         ) -> list[tuple[str, float, float, int, int]]:
+    """Stamp start_time / end_time and chroma_start_frame / chroma_end_frame
+    on every section in template["structure"], sourced from the ground-truth
+    bounds. Returns the per-section table of (section_id, start_time,
+    end_time, chroma_start_frame, chroma_end_frame) for confirmation logging.
+
+    Raises KeyError listing every template section that has no matching
+    ground-truth entry. The caller turns that into an error exit.
     """
     fps = sample_rate / hop_length
-    n = 0
+    missing: list[str] = []
+    table: list[tuple[str, float, float, int, int]] = []
     for section in template.get("structure", []):
-        st = section.get("start_time")
-        et = section.get("end_time")
-        if st is None or et is None:
-            section.pop("chroma_start_frame", None)
-            section.pop("chroma_end_frame", None)
+        sid = section.get("section_id")
+        if sid is None:
             continue
-        section["chroma_start_frame"] = int(round(float(st) * fps))
-        section["chroma_end_frame"] = int(round(float(et) * fps))
-        n += 1
-    return n
+        if sid not in gt_bounds:
+            missing.append(sid)
+            continue
+        start, end = gt_bounds[sid]
+        section["start_time"] = round(float(start), 3)
+        section["end_time"] = round(float(end), 3)
+        cs = int(round(float(start) * fps))
+        ce = int(round(float(end) * fps))
+        section["chroma_start_frame"] = cs
+        section["chroma_end_frame"] = ce
+        table.append((sid, float(start), float(end), cs, ce))
+    if missing:
+        raise KeyError(missing)
+    return table
 
 
 def write_chroma_into_template(template: dict, chroma_matrix: np.ndarray,
@@ -129,6 +166,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--template", type=Path, required=True,
                    help="Path to an *_aligned.json template (will be updated "
                         "in place).")
+    p.add_argument("--ground-truth", type=Path, required=True,
+                   help="Path to the song's ground-truth JSON. Source of truth "
+                        "for section start/end times.")
     p.add_argument("--audio", type=Path, default=None,
                    help="Reference audio path. Defaults to looking up the "
                         "template's references[0] under tooling/references/<song_id>/.")
@@ -142,6 +182,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     template = json.loads(args.template.read_text())
+
+    if not args.ground_truth.exists():
+        log.error("Ground-truth file not found: %s", args.ground_truth)
+        return 1
+    gt_bounds = _load_ground_truth_bounds(args.ground_truth)
+    log.info("Loaded %d ground-truth sections from %s",
+             len(gt_bounds), args.ground_truth)
 
     audio_path = args.audio
     if audio_path is None:
@@ -164,8 +211,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     write_chroma_into_template(template, chroma_matrix, sr_used, hop_length)
     log.info("Stored %d chroma frames in template", chroma_matrix.shape[0])
 
-    n_stamped = stamp_section_frames(template, sr_used, hop_length)
-    log.info("Stamped chroma frame indices on %d sections", n_stamped)
+    try:
+        stamped = stamp_section_bounds(template, gt_bounds, sr_used, hop_length)
+    except KeyError as missing_exc:
+        for sid in missing_exc.args[0]:
+            log.error("ERROR: no ground truth for section %s", sid)
+        return 1
+
+    log.info("Stamped %d sections:", len(stamped))
+    for sid, start, end, cs, ce in stamped:
+        log.info(
+            "  %s: t=[%.1f, %.1f]s frames=[%d, %d]",
+            sid, start, end, cs, ce,
+        )
 
     args.template.write_text(json.dumps(template, indent=2))
     return 0

@@ -49,8 +49,23 @@ jobs:
           cache: pip
           cache-dependency-path: tooling/requirements.txt
 
+      - name: Cache Demucs model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch/hub
+          key: torch-hub-htdemucs-${{ runner.os }}-v1
+
       - name: Install dependencies
-        run: pip install -r tooling/requirements.txt
+        run: |
+          set -euo pipefail
+          pip install -r tooling/requirements.txt
+          # Re-anchoring reuses detect_first_verse's vocal isolation, which
+          # shells out to `python -m demucs.separate`. Match the install
+          # block in .github/workflows/detect-first-verse.yml exactly so
+          # the same model + torchcodec save path that works there works
+          # here. Always installed (cheap when the pip cache is warm),
+          # since deciding from inputs would add fragility for no real win.
+          pip install "demucs>=4.0" torchcodec
 
       - name: Resolve validation target
         id: target

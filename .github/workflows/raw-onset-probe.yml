@@ -1,0 +1,110 @@
+name: Raw onset probe
+
+# De-risking experiment: can vocal onsets be detected on RAW phone-mic
+# audio, with no Demucs? Runs tooling/raw_onset_probe.py (full-spectrum
+# and vocal-band envelopes) against ground-truth section starts.
+# Deliberately NO Demucs / torch anywhere in this workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      audio_url:
+        description: 'Direct download URL for audio (Dropbox ?dl=0 auto-flipped to ?dl=1)'
+        required: true
+        type: string
+      song_id:
+        description: 'Song id, used to locate the default ground-truth file'
+        required: true
+        type: string
+        default: peggy_o
+      ground_truth_path:
+        description: 'Ground-truth JSON path (default: tooling/ground_truth/{song_id}_band.json)'
+        required: false
+        type: string
+        default: ''
+      song_offset:
+        description: 'Ignore audio before this time, in seconds (pre-song noodling)'
+        required: false
+        type: number
+        default: 20.0
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Run raw-mic onset probe
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Python deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # Raw load + filter + RMS only -- no Demucs, no whisper, no torch.
+          pip install "librosa>=0.10" "scipy>=1.10" "soundfile>=0.12" "numpy>=1.24"
+
+      - name: Download audio
+        env:
+          AUDIO_URL: ${{ inputs.audio_url }}
+        run: |
+          set -euo pipefail
+          url="$AUDIO_URL"
+          if [[ "$url" == *"dropbox.com"* ]]; then
+            url="${url/?dl=0/?dl=1}"
+            case "$url" in
+              *\?dl=1*) ;;
+              *\?*) url="${url}&dl=1" ;;
+              *) url="${url}?dl=1" ;;
+            esac
+          fi
+          mkdir -p probe
+          echo "Downloading audio from: $url"
+          # No extension on purpose: raw_onset_probe re-encodes via ffmpeg.
+          curl -L --fail --max-time 600 -o probe/audio "$url"
+          ls -la probe/audio
+
+      - name: Run raw onset probe
+        env:
+          SONG_ID: ${{ inputs.song_id }}
+          GT_PATH: ${{ inputs.ground_truth_path }}
+          SONG_OFFSET: ${{ inputs.song_offset }}
+        run: |
+          set -euo pipefail
+          gt_path="${GT_PATH:-tooling/ground_truth/${SONG_ID}_band.json}"
+          python tooling/raw_onset_probe.py \
+            --audio probe/audio \
+            --ground-truth "$gt_path" \
+            --song-offset "$SONG_OFFSET" \
+            --output-md probe/raw_onset.md \
+            --output-json probe/raw_onset.json | tee probe/stdout.txt
+
+      - name: Append report to job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f probe/raw_onset.md ]]; then
+            cat probe/raw_onset.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-onset-probe-report
+          path: probe/
+          if-no-files-found: warn
+          retention-days: 30

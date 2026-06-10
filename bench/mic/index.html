@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stage 1b: live-mic separation + onset detection</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, system-ui, sans-serif;
+    max-width: 640px; margin: 0 auto; padding: 16px;
+    line-height: 1.4;
+  }
+  h1 { font-size: 1.2rem; }
+  #record {
+    display: block; width: 100%; padding: 18px; margin: 16px 0 8px;
+    font-size: 1.4rem; font-weight: 700; border-radius: 12px;
+    border: none; background: #dc2626; color: #fff;
+  }
+  #record.recording { background: #111827; }
+  #record:disabled { background: #9ca3af; }
+  .controls { display: flex; gap: 10px; align-items: center; margin: 8px 0; }
+  .controls label { font-size: 0.95rem; }
+  .controls input { width: 5em; font-size: 1.1rem; padding: 4px; }
+  #reanalyze, #play {
+    padding: 8px 14px; font-size: 1rem; font-weight: 600;
+    border-radius: 8px; border: 1px solid #8888; background: transparent;
+  }
+  #status { font-size: 1.05rem; min-height: 1.4em; font-weight: 600; }
+  #meter-wrap { height: 18px; border: 1px solid #8884; border-radius: 6px;
+                margin: 8px 0; overflow: hidden; }
+  #meter { height: 100%; width: 0%; background: #16a34a; transition: width 60ms linear; }
+  #meter.hot { background: #dc2626; }
+  #meter-db { font-size: 0.85rem; opacity: 0.8; font-variant-numeric: tabular-nums; }
+  #provider {
+    display: none; margin: 14px 0; padding: 10px; border-radius: 12px;
+    font-size: 1.4rem; font-weight: 800; text-align: center; color: #fff;
+  }
+  #provider.webgpu { background: #16a34a; }
+  #provider.wasm { background: #d97706; }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+  th, td { padding: 6px 4px; border-bottom: 1px solid #8884; text-align: left; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap;
+           font-size: 1.15rem; font-weight: 700; }
+  #mic-settings td.warn { color: #dc2626; font-weight: 800; }
+  canvas { width: 100%; height: 240px; border: 1px solid #8884; border-radius: 8px;
+           margin: 10px 0; display: block; }
+  #errors {
+    display: none; margin: 16px 0; padding: 12px; border-radius: 8px;
+    background: #fef2f2; color: #991b1b; border: 2px solid #dc2626;
+  }
+  #errors h2 { margin: 0 0 6px; font-size: 1rem; }
+  #errors pre { white-space: pre-wrap; word-break: break-word;
+                font-size: 0.8rem; margin: 6px 0; }
+  #log {
+    white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, monospace;
+    font-size: 0.72rem; opacity: 0.75; margin-top: 16px;
+    max-height: 14em; overflow-y: auto; border-top: 1px solid #8884; padding-top: 8px;
+  }
+  .note { font-size: 0.85rem; opacity: 0.8; }
+</style>
+</head>
+<body>
+<h1>Stage 1b: live-mic separation + onset detection</h1>
+<p class="note">
+  Same chain as <code>bench/detect/</code> — umxhq vocals core, vocal-band
+  (250–3000&nbsp;Hz) energy, baseline+offset sustained-onset detector —
+  but the audio comes from the phone mic in the room. Records up to
+  45&nbsp;s of raw PCM. <b>Start recording while the band plays
+  instrumentally</b> (the first ~8&nbsp;s are the baseline), then have a
+  vocal entry happen mid-recording. Times are relative to recording start
+  (song offset 0; everything else matches the detect page).
+</p>
+
+<button id="record">● Record</button>
+<div class="controls">
+  <label for="offset-db">Threshold offset (dB above baseline):</label>
+  <input id="offset-db" type="number" value="20" step="1" min="3" max="60">
+  <button id="reanalyze" disabled>Re-analyze</button>
+  <button id="play" disabled>▶ Play recording</button>
+</div>
+<div id="status"></div>
+<div id="meter-wrap"><div id="meter"></div></div>
+<div id="meter-db">level: –</div>
+
+<table id="mic-settings" style="display:none">
+  <tr><th colspan="2">Actual mic track settings (getSettings) — iOS may ignore the "off" requests</th></tr>
+  <tr><td>echoCancellation</td><td class="num" id="s-ec"></td></tr>
+  <tr><td>noiseSuppression</td><td class="num" id="s-ns"></td></tr>
+  <tr><td>autoGainControl</td><td class="num" id="s-agc"></td></tr>
+  <tr><td>sampleRate</td><td class="num" id="s-sr"></td></tr>
+  <tr><td>channelCount</td><td class="num" id="s-ch"></td></tr>
+</table>
+
+<div id="provider"></div>
+<div id="results" style="display:none">
+  <canvas id="plot" width="640" height="240"></canvas>
+  <table>
+    <tr><td>Recording duration</td><td class="num" id="r-dur"></td></tr>
+    <tr><td>Detected onsets</td><td class="num" id="r-onsets"></td></tr>
+    <tr><td>Baseline / threshold (band dB)</td><td class="num" id="r-thresh"></td></tr>
+    <tr><td>Processing time (STFT + inference + detect)</td><td class="num" id="r-total"></td></tr>
+    <tr><td>Processing real-time factor</td><td class="num" id="r-rtf"></td></tr>
+  </table>
+  <p class="note" id="env-info"></p>
+</div>
+
+<div id="errors"><h2>Errors</h2><div id="error-list"></div></div>
+<div id="log"></div>
+
+<script type="module" src="mic.js"></script>
+<noscript>This benchmark requires JavaScript.</noscript>
+</body>
+</html>

@@ -285,14 +285,22 @@ def _detect_reanchor_onsets(audio_path: Path,
                             template_sections: list[dict],
                             test_to_ref: np.ndarray,
                             fps: float,
-                            song_offset: float) -> tuple[list[tuple[str, float, float]], dict]:
+                            song_offset: float,
+                            separator: str = "demucs"
+                            ) -> tuple[list[tuple[str, float, float]], dict]:
     """For each named section, find a vocal onset in the test audio within
     ±REANCHOR_SEARCH_WINDOW_SEC of DTW's current guess for that section.
 
-    Reuses tooling/detect_first_verse: Demucs runs once, the smoothed
+    Reuses tooling/detect_first_verse: the separator runs once, the smoothed
     envelope is computed once, and the auto-threshold is calibrated from
     a single baseline window so all anchor searches share consistent
     sensitivity.
+
+    `separator` picks which model produces the vocal stem the onset search
+    runs on: "demucs" (htdemucs, the known-good default) or "open_unmix"
+    (umxhq, the lower-quality real-time/browser-grade proxy from
+    stem_quality_probe). Everything downstream of the stem -- the search
+    window, the energy-onset logic, the segmented DTW -- is identical.
 
     Returns (anchors, info) where:
       anchors: list of (section_id, ref_start_sec, detected_test_sec)
@@ -305,12 +313,24 @@ def _detect_reanchor_onsets(audio_path: Path,
         for s in template_sections
     }
 
-    info: dict = {"per_section": [], "demucs_used": True,
+    info: dict = {"per_section": [], "separator": separator,
+                  "demucs_used": separator == "demucs",
                   "threshold_db": None, "baseline_db": None,
                   "fallback_triggered": False, "vocal_rms_db": None}
 
-    log.info("Re-anchor: isolating vocals via Demucs ...")
-    vocals_path, demucs_dir, vocal_rms_db = dfv._separate_vocals(audio_path)
+    sep_wav: Optional[Path] = None
+    if separator == "open_unmix":
+        # stem_quality_probe owns the Open-Unmix path; its separator reads
+        # via soundfile, so pre-convert the (possibly extensionless) input
+        # to the 44.1 kHz WAV it expects. Demucs decodes inputs itself.
+        import stem_quality_probe as sqp  # noqa: PLC0415
+        log.info("Re-anchor: isolating vocals via Open-Unmix (%s) ...",
+                 sqp.OPENUNMIX_MODEL)
+        sep_wav = sqp._ensure_separation_wav(audio_path)
+        vocals_path, stem_dir, vocal_rms_db = sqp._separate_vocals_openunmix(sep_wav)
+    else:
+        log.info("Re-anchor: isolating vocals via Demucs ...")
+        vocals_path, stem_dir, vocal_rms_db = dfv._separate_vocals(audio_path)
     info["vocal_rms_db"] = round(vocal_rms_db, 2)
     log.info("Re-anchor: vocal stem RMS %.1f dB", vocal_rms_db)
     try:
@@ -392,7 +412,12 @@ def _detect_reanchor_onsets(audio_path: Path,
             info["per_section"].append(entry)
     finally:
         import shutil  # noqa: PLC0415
-        shutil.rmtree(demucs_dir, ignore_errors=True)
+        shutil.rmtree(stem_dir, ignore_errors=True)
+        if sep_wav is not None:
+            try:
+                os.unlink(sep_wav)
+            except OSError:
+                pass
 
     return anchors, info
 
@@ -549,7 +574,16 @@ def _build_report(template: dict, audio_path: Path,
         requested = [e["section_id"] for e in reanchor_info.get("per_section", [])]
         anchors = reanchor_info.get("anchors", [])
         segments = reanchor_info.get("segments", [])
+        separator_labels = {
+            "demucs": "demucs (htdemucs, high-quality reference)",
+            "open_unmix": "open_unmix (umxhq, real-time/browser-grade proxy)",
+        }
+        separator = reanchor_info.get("separator", "demucs")
         out += ["", "## Re-anchoring", ""]
+        out.append(
+            f"- Onset-detection separator: "
+            f"{separator_labels.get(separator, separator)}"
+        )
         out.append(f"- Re-anchor sections: {', '.join(requested) or '(none)'}")
         if anchors:
             for a in anchors:
@@ -642,6 +676,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "Each becomes a boundary at which the test audio is "
                         "split and DTW is run independently per segment. "
                         "Empty (default) keeps single-pass DTW behaviour.")
+    p.add_argument("--reanchor-separator", choices=["demucs", "open_unmix"],
+                   default="demucs",
+                   help="Which separator produces the vocal stem that "
+                        "re-anchor onset detection runs on. demucs (default): "
+                        "htdemucs, the known-good high-quality path. "
+                        "open_unmix: umxhq, the lower-quality real-time/"
+                        "browser-grade proxy from stem_quality_probe. Only "
+                        "used when --reanchor-sections is set.")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -683,12 +725,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     reanchor_info: Optional[dict] = None
     segments_info: list[dict] = []
     if sections_to_anchor:
-        log.info("Re-anchor: requested sections = %s", sections_to_anchor)
+        log.info("Re-anchor: requested sections = %s (separator=%s)",
+                 sections_to_anchor, args.reanchor_separator)
         anchors, reanchor_info = _detect_reanchor_onsets(
             args.audio,
             sections_to_anchor,
             template.get("structure") or [],
             test_to_ref, fps, args.song_offset,
+            separator=args.reanchor_separator,
         )
         if anchors:
             log.info("Re-anchor: %d anchor(s) found; running segmented DTW",

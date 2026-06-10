@@ -1,0 +1,125 @@
+name: Export Open-Unmix ONNX
+
+# Exports the Open-Unmix (umxhq, vocals) SPECTROGRAM-DOMAIN core to ONNX
+# for the bench/umx/ WebGPU benchmark page. No STFT/ISTFT/Wiener filtering
+# in the graph -- magnitude spectrogram in, estimated magnitude out.
+# Fixed input shape (1, 2, 2049, 302) ~= 7s of audio at FFT 4096 / hop
+# 1024 / 44.1 kHz; static shapes are far more reliable on onnxruntime-web
+# than dynamic axes. The export is validated against torch with one
+# onnxruntime CPU inference and uploaded as an artifact. At ~34 MB the
+# model is committed at bench/umx/umx_vocals.onnx; this workflow exists to
+# reproduce/refresh it.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    name: Export umxhq vocals spectrogram core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch/hub
+          key: torch-hub-umxhq-${{ runner.os }}-v1
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # CPU-only torch; onnxruntime for the CPU validation inference.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "openunmix>=1.2" onnx onnxruntime numpy
+          python -c "import torch; print('torch', torch.__version__)"
+
+      - name: Export and validate
+        run: |
+          set -euo pipefail
+          mkdir -p export
+          python - export/umx_vocals.onnx <<'PY'
+          """Export Open-Unmix (umxhq, vocals) spectrogram core to ONNX.
+
+          Spectrogram-domain network ONLY (magnitude spectrogram in ->
+          estimated magnitude spectrogram out). No STFT/ISTFT/Wiener
+          filtering -- this is the heavy neural core, which is all the
+          WebGPU timing benchmark needs.
+
+          Fixed input shape for ~7s of audio: with FFT 4096 / hop 1024 /
+          center=True at 44100 Hz, 7.0s (308700 samples) ->
+          floor(308700/1024)+1 = 302 frames. Static shapes are far more
+          reliable than dynamic axes on onnxruntime-web.
+          """
+          import sys
+          import numpy as np
+          import torch
+          from openunmix import umxhq_spec
+
+          N_FFT = 4096
+          HOP = 1024
+          SR = 44100
+          NB_BINS = N_FFT // 2 + 1          # 2049
+          NB_FRAMES = int(7.0 * SR) // HOP + 1  # 302
+          INPUT_SHAPE = (1, 2, NB_BINS, NB_FRAMES)
+          AUDIO_SEC = (NB_FRAMES - 1) * HOP / SR
+          OUT = sys.argv[1] if len(sys.argv) > 1 else "umx_vocals.onnx"
+
+          print(f"input shape (nb_samples, nb_channels, nb_bins, nb_frames): {INPUT_SHAPE}")
+          print(f"equivalent audio duration: {AUDIO_SEC:.3f}s @ {SR} Hz (hop {HOP})")
+
+          model = umxhq_spec(targets=["vocals"], pretrained=True)["vocals"]
+          model.eval()
+
+          dummy = torch.rand(*INPUT_SHAPE, dtype=torch.float32)
+          with torch.no_grad():
+              ref = model(dummy)
+
+          torch.onnx.export(
+              model, dummy, OUT,
+              input_names=["mag_spec"],
+              output_names=["est_mag_spec"],
+              opset_version=17,
+              do_constant_folding=True,
+              dynamo=False,  # legacy tracer: mature LSTM support, static shapes
+          )
+
+          import os
+          size_mb = os.path.getsize(OUT) / 1024 / 1024
+          print(f"exported {OUT}: {size_mb:.1f} MB")
+
+          # Validate with one onnxruntime CPU inference against torch.
+          import onnxruntime as ort_rt
+          sess = ort_rt.InferenceSession(OUT, providers=["CPUExecutionProvider"])
+          (out,) = sess.run(None, {"mag_spec": dummy.numpy()})
+          assert out.shape == tuple(ref.shape), f"shape mismatch {out.shape} vs {tuple(ref.shape)}"
+          max_diff = float(np.abs(out - ref.numpy()).max())
+          print(f"onnxruntime CPU validation: output shape {out.shape}, "
+                f"max |onnx - torch| = {max_diff:.3e}")
+          assert max_diff < 1e-3, "ONNX output diverges from torch"
+          print("EXPORT VALIDATED OK")
+          PY
+          echo "fresh export sha256:  $(sha256sum export/umx_vocals.onnx | cut -d' ' -f1)"
+          if [[ -f bench/umx/umx_vocals.onnx ]]; then
+            echo "committed file sha256: $(sha256sum bench/umx/umx_vocals.onnx | cut -d' ' -f1)"
+            echo "(hashes may differ across torch versions; the validation above is what matters)"
+          fi
+
+      - name: Upload ONNX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: umx-vocals-onnx
+          path: export/umx_vocals.onnx
+          if-no-files-found: error
+          retention-days: 30

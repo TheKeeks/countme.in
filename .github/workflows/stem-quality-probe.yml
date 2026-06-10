@@ -1,0 +1,121 @@
+name: Stem quality probe
+
+# Feasibility gate for the separate-then-detect live architecture: does a
+# LOWER-QUALITY separator (Open-Unmix umxhq, standing in for real-time /
+# browser-grade separation) still produce a vocal stem clean enough for the
+# energy-onset detector to find verse_5? Runs tooling/stem_quality_probe.py,
+# which puts Demucs (known-good reference) and Open-Unmix through the same
+# detection side by side. CPU only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      audio_url:
+        description: 'Direct download URL for audio (Dropbox ?dl=0 auto-flipped to ?dl=1)'
+        required: true
+        type: string
+      song_id:
+        description: 'Song id, used to locate the default ground-truth file'
+        required: true
+        type: string
+        default: peggy_o
+      ground_truth_path:
+        description: 'Ground-truth JSON path (default: tooling/ground_truth/{song_id}_band.json)'
+        required: false
+        type: string
+        default: ''
+      song_offset:
+        description: 'Ignore audio before this time, in seconds (pre-song noodling)'
+        required: false
+        type: number
+        default: 20.0
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Run stem-quality probe
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch/hub
+          key: torch-hub-stem-quality-${{ runner.os }}-v1
+
+      - name: Install Python deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # CPU-only torch first so demucs/openunmix don't drag in the
+          # CUDA wheels; torchcodec is the torchaudio decode backend.
+          pip install torch torchaudio torchcodec --index-url https://download.pytorch.org/whl/cpu
+          pip install "demucs>=4.0" "openunmix>=1.2" "librosa>=0.10" "scipy>=1.10" "soundfile>=0.12"
+          python -c "import torch; print('torch', torch.__version__)"
+
+      - name: Download audio
+        env:
+          AUDIO_URL: ${{ inputs.audio_url }}
+        run: |
+          set -euo pipefail
+          url="$AUDIO_URL"
+          if [[ "$url" == *"dropbox.com"* ]]; then
+            url="${url/?dl=0/?dl=1}"
+            case "$url" in
+              *\?dl=1*) ;;
+              *\?*) url="${url}&dl=1" ;;
+              *) url="${url}?dl=1" ;;
+            esac
+          fi
+          mkdir -p probe
+          echo "Downloading audio from: $url"
+          # No extension on purpose: stem_quality_probe re-encodes via ffmpeg.
+          curl -L --fail --max-time 600 -o probe/audio "$url"
+          ls -la probe/audio
+
+      - name: Run stem quality probe
+        env:
+          SONG_ID: ${{ inputs.song_id }}
+          GT_PATH: ${{ inputs.ground_truth_path }}
+          SONG_OFFSET: ${{ inputs.song_offset }}
+        run: |
+          set -euo pipefail
+          gt_path="${GT_PATH:-tooling/ground_truth/${SONG_ID}_band.json}"
+          python tooling/stem_quality_probe.py \
+            --audio probe/audio \
+            --ground-truth "$gt_path" \
+            --song-offset "$SONG_OFFSET" \
+            --output-md probe/stem_quality.md \
+            --output-json probe/stem_quality.json | tee probe/stdout.txt
+
+      - name: Append report to job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f probe/stem_quality.md ]]; then
+            cat probe/stem_quality.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stem-quality-probe-report
+          path: probe/
+          if-no-files-found: warn
+          retention-days: 30

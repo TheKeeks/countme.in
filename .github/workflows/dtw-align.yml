@@ -25,6 +25,14 @@ on:
         required: false
         type: string
         default: ''
+      reanchor_separator:
+        description: 'Separator producing the vocal stem for re-anchor onset detection: demucs (known-good) or open_unmix (umxhq, real-time/browser-grade proxy)'
+        required: false
+        type: choice
+        default: demucs
+        options:
+          - demucs
+          - open_unmix
 
 permissions:
   contents: read
@@ -49,11 +57,11 @@ jobs:
           cache: pip
           cache-dependency-path: tooling/requirements.txt
 
-      - name: Cache Demucs model weights
+      - name: Cache separator model weights
         uses: actions/cache@v4
         with:
           path: ~/.cache/torch/hub
-          key: torch-hub-htdemucs-${{ runner.os }}-v1
+          key: torch-hub-dtw-separators-${{ runner.os }}-v1
 
       - name: Install dependencies
         run: |
@@ -63,9 +71,10 @@ jobs:
           # shells out to `python -m demucs.separate`. Match the install
           # block in .github/workflows/detect-first-verse.yml exactly so
           # the same model + torchcodec save path that works there works
-          # here. Always installed (cheap when the pip cache is warm),
-          # since deciding from inputs would add fragility for no real win.
-          pip install "demucs>=4.0" torchcodec
+          # here. openunmix backs the open_unmix reanchor_separator choice.
+          # Always installed (cheap when the pip cache is warm), since
+          # deciding from inputs would add fragility for no real win.
+          pip install "demucs>=4.0" torchcodec "openunmix>=1.2"
 
       - name: Resolve validation target
         id: target
@@ -141,6 +150,7 @@ jobs:
           GT_PATH: ${{ steps.target.outputs.ground_truth_path }}
           SONG_OFFSET: ${{ steps.target.outputs.song_offset }}
           REANCHOR_SECTIONS: ${{ inputs.reanchor_sections }}
+          REANCHOR_SEPARATOR: ${{ inputs.reanchor_separator }}
         run: |
           set -euo pipefail
           template="tooling/songs/${SONG_ID}_aligned.json"
@@ -156,6 +166,7 @@ jobs:
           fi
           if [[ -n "${REANCHOR_SECTIONS:-}" ]]; then
             args+=(--reanchor-sections "$REANCHOR_SECTIONS")
+            args+=(--reanchor-separator "${REANCHOR_SEPARATOR:-demucs}")
           fi
           python tooling/dtw_align.py "${args[@]}"
           ls -la dtw/

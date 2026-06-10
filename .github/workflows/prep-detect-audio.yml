@@ -1,0 +1,74 @@
+name: Prep detect-page audio
+
+# The band recording is ~50MB -- too big for GitHub's 25MB web uploader.
+# This fetches it from the same audio URL the validation workflows take,
+# transcodes to a small stereo mp3, and commits it to
+# bench/detect/band.mp3 for the Stage 1a in-browser detection page.
+
+on:
+  workflow_dispatch:
+    inputs:
+      audio_url:
+        description: 'Direct download URL for the band recording (Dropbox ?dl=0 auto-flipped to ?dl=1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prep:
+    name: Fetch, compress, commit band.mp3
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Download audio
+        env:
+          AUDIO_URL: ${{ inputs.audio_url }}
+        run: |
+          set -euo pipefail
+          url="$AUDIO_URL"
+          if [[ "$url" == *"dropbox.com"* ]]; then
+            url="${url/?dl=0/?dl=1}"
+            case "$url" in
+              *\?dl=1*) ;;
+              *\?*) url="${url}&dl=1" ;;
+              *) url="${url}?dl=1" ;;
+            esac
+          fi
+          echo "Downloading audio..."
+          # URL stays quoted throughout -- it contains & and would break unquoted.
+          curl -fSL "$url" -o input_audio
+          ls -la input_audio
+
+      - name: Transcode to compressed mp3
+        run: |
+          set -euo pipefail
+          mkdir -p bench/detect
+          ffmpeg -y -loglevel error -i input_audio \
+            -ar 44100 -ac 2 -codec:a libmp3lame -b:a 128k \
+            bench/detect/band.mp3
+          ls -la bench/detect/band.mp3
+          ffprobe -v error -show_entries format=duration,size \
+            -of default=noprint_wrappers=1 bench/detect/band.mp3
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bench/detect/band.mp3
+          if git diff --cached --quiet; then
+            echo "band.mp3 unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "Add compressed band recording for bench/detect (CI transcode)"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

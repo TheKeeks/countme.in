@@ -42,6 +42,13 @@ function setStatus(msg) {
   if (msg) logLine(`STATUS: ${msg}`);
 }
 
+/** Update the status line without echoing to the log — for high-frequency
+ * progress updates (download chunks) that would otherwise flood the log
+ * div with thousands of DOM appends. */
+function setStatusQuiet(msg) {
+  $("status").textContent = msg;
+}
+
 function showError(context, err) {
   const box = $("errors");
   box.style.display = "block";
@@ -166,12 +173,17 @@ async function downloadModel() {
     const reader = resp.body.getReader();
     const chunks = [];
     let loaded = 0;
+    let nextLogAt = 0;
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       chunks.push(value);
       loaded += value.length;
-      setStatus(`Downloading model: ${fmtMB(loaded)}${total ? ` / ${fmtMB(total)}` : ""}`);
+      setStatusQuiet(`Downloading model: ${fmtMB(loaded)}${total ? ` / ${fmtMB(total)}` : ""}`);
+      if (loaded >= nextLogAt) {
+        logLine(`download: ${fmtMB(loaded)}${total ? ` / ${fmtMB(total)}` : ""}`);
+        nextLogAt += 32 * 1024 * 1024;
+      }
     }
     const all = new Uint8Array(loaded);
     let off = 0;

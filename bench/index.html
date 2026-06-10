@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebGPU separation-speed benchmark</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, system-ui, sans-serif;
+    max-width: 640px; margin: 0 auto; padding: 16px;
+    line-height: 1.4;
+  }
+  h1 { font-size: 1.2rem; }
+  #run {
+    display: block; width: 100%; padding: 18px; margin: 16px 0;
+    font-size: 1.4rem; font-weight: 700; border-radius: 12px;
+    border: none; background: #2563eb; color: #fff;
+  }
+  #run:disabled { background: #9ca3af; }
+  #status { font-size: 1.05rem; min-height: 1.4em; font-weight: 600; }
+  #provider {
+    display: none; margin: 16px 0; padding: 14px; border-radius: 12px;
+    font-size: 1.9rem; font-weight: 800; text-align: center; color: #fff;
+  }
+  #provider.webgpu { background: #16a34a; }
+  #provider.wasm { background: #d97706; }
+  #rtf-line { font-size: 1.15rem; font-weight: 700; margin: 10px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+  td { padding: 7px 4px; border-bottom: 1px solid #8884; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums;
+           font-size: 1.5rem; font-weight: 700; white-space: nowrap; }
+  #errors {
+    display: none; margin: 16px 0; padding: 12px; border-radius: 8px;
+    background: #fef2f2; color: #991b1b; border: 2px solid #dc2626;
+  }
+  #errors h2 { margin: 0 0 6px; font-size: 1rem; }
+  #errors pre { white-space: pre-wrap; word-break: break-word;
+                font-size: 0.8rem; margin: 6px 0; }
+  #log {
+    white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, monospace;
+    font-size: 0.72rem; opacity: 0.75; margin-top: 16px;
+    max-height: 14em; overflow-y: auto; border-top: 1px solid #8884; padding-top: 8px;
+  }
+  .note { font-size: 0.85rem; opacity: 0.8; }
+</style>
+</head>
+<body>
+<h1>WebGPU separation-speed benchmark</h1>
+<p class="note">
+  Demucs (htdemucs) via <code>demucs-web@1.0.2</code> +
+  <code>onnxruntime-web@1.23.2</code> on a bundled 7s public-domain clip
+  (Scott Joplin, Maple Leaf Rag, 1916). Tapping Run downloads the
+  ~172&nbsp;MB ONNX model from Hugging Face — Wi-Fi recommended.
+  Timing only; nothing plays and nothing uploads.
+</p>
+
+<button id="run">Run benchmark</button>
+<div id="status"></div>
+
+<div id="provider"></div>
+<div id="results" style="display:none">
+  <div id="rtf-line"></div>
+  <table>
+    <tr><td>Real-time factor (compute ÷ clip)</td><td class="num" id="r-rtf"></td></tr>
+    <tr><td>Separation compute time</td><td class="num" id="r-compute"></td></tr>
+    <tr><td>Clip duration</td><td class="num" id="r-clip"></td></tr>
+    <tr><td>Model load time (download + init)</td><td class="num" id="r-load"></td></tr>
+    <tr><td>&nbsp;&nbsp;… model download</td><td class="num" id="r-download"></td></tr>
+    <tr><td>&nbsp;&nbsp;… session init</td><td class="num" id="r-init"></td></tr>
+  </table>
+  <p class="note" id="gpu-info"></p>
+  <p class="note" id="env-info"></p>
+</div>
+
+<div id="errors"><h2>Errors</h2><div id="error-list"></div></div>
+<div id="log"></div>
+
+<script type="module" src="bench.js"></script>
+<noscript>This benchmark requires JavaScript.</noscript>
+</body>
+</html>

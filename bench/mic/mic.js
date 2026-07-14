@@ -8,12 +8,15 @@
  * real-world unknown this tests: does vocal energy survive band bleed on
  * the actual iOS mic.
  *
- * The DSP/detection module is imported from bench/detect/dsp.js (already
- * pure and parity-tested against torch/numpy). Only the detector is a
- * local copy: the threshold offset must be adjustable here, and dsp.js
- * hard-codes +20 dB. Song offset is 0 — times are relative to recording
- * start, and the first BASELINE_WINDOW_SEC of the recording are the
- * baseline (start recording during instrumental playing).
+ * The DSP/detection module is imported from bench/detect/dsp.js (pure,
+ * parity-tested against torch/numpy). Detection is the two-feature AND
+ * gate tuned on the real band recording: absolute vocal-band energy AND
+ * the vocal-to-mix ratio must both fire within ±1.5s — energy alone lets
+ * jam leak through (9 false onsets on the reference recording); the gate
+ * zeroes them. Both offsets are adjustable inputs here. Song offset is
+ * 0 — times are relative to recording start, and the first
+ * BASELINE_WINDOW_SEC of the recording are the baseline (start recording
+ * during instrumental playing).
  *
  * Same self-reporting as the other bench pages: every number, status
  * change, and full error text renders on the page.
@@ -21,9 +24,9 @@
 
 import {
   FFT, N_FFT, HOP, NB_BINS, hannWindow, stftFrameMag, numFrames,
-  powerToEnvelopeDb, smoothEnvelope,
+  powerToEnvelopeDb, smoothEnvelope, detectOnsets, andCombineOnsets,
   BASELINE_WINDOW_SEC, SUSTAIN_WINDOW_SEC, SUSTAIN_TOLERANCE_DB,
-  ENV_FRAME_SEC,
+  RATIO_OFFSET_DB, AND_MATCH_SEC,
 } from "../detect/dsp.js";
 
 // Same onnxruntime-web version as the other bench pages.
@@ -89,49 +92,6 @@ const fmtSec = (s) => `${s.toFixed(2)} s`;
 const yieldToUI = () => new Promise((r) => setTimeout(r, 0));
 
 // ---------------------------------------------------------------------------
-// Detector — local copy of dsp.detectOnsets with the threshold offset as a
-// parameter (dsp.js hard-codes +20 dB; bench/detect/ must stay untouched).
-// Identical structure: baseline median, sustained rising-edge crossings.
-// ---------------------------------------------------------------------------
-
-function median(values) {
-  if (values.length === 0) return null;
-  const s = Float64Array.from(values).sort();
-  const m = s.length >> 1;
-  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
-}
-
-function detectOnsetsOffset(times, db, songOffset, offsetDb) {
-  const baseVals = [];
-  for (let i = 0; i < times.length; i++) {
-    if (times[i] >= songOffset && times[i] < songOffset + BASELINE_WINDOW_SEC) {
-      baseVals.push(db[i]);
-    }
-  }
-  const baselineDb = median(baseVals);
-  const thresholdDb = baselineDb === null ? Infinity : baselineDb + offsetDb;
-
-  const dt = times.length > 1 ? times[1] - times[0] : ENV_FRAME_SEC;
-  const windowFrames = Math.max(1, Math.ceil(SUSTAIN_WINDOW_SEC / dt));
-  const medianFloor = thresholdDb - SUSTAIN_TOLERANCE_DB;
-  const n = times.length;
-
-  const onsets = [];
-  let prevBelow = true;
-  for (let i = 0; i < n; i++) {
-    if (times[i] < songOffset) continue;
-    const above = db[i] >= thresholdDb;
-    if (above && prevBelow) {
-      const win = Array.from(db.subarray(i, Math.min(i + windowFrames, n)));
-      const m = median(win);
-      if (win.length > 0 && m !== null && m >= medianFloor) onsets.push(times[i]);
-    }
-    prevBelow = !above;
-  }
-  return { baselineDb, thresholdDb, onsets };
-}
-
-// ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
@@ -144,8 +104,9 @@ const state = {
   recording: false,
   stopRequested: false,
   captured: null,   // { samples: Float32Array (mono, capture rate), rate }
-  resampled: null,  // Float32Array @ 44100
-  envelope: null,   // { times, db } from the last analysis
+  resampled: null,     // Float32Array @ 44100
+  envelope: null,      // { times, db } — absolute vocal-band energy
+  envelopeRatio: null, // { times, db } — vocal-to-mix ratio (second gate)
   timings: null,
   playbackCtx: null,
   playbackSource: null,
@@ -421,6 +382,7 @@ async function separateToBandPower(mono) {
   const plane = NB_BINS * CHUNK_FRAMES;
   const input = new Float32Array(2 * plane);
   const vocalPower = new Float64Array(totalFrames);
+  const mixPower = new Float64Array(totalFrames); // for the ratio gate
 
   let stftSec = 0, inferSec = 0;
   for (let c = 0; c < nChunks; c++) {
@@ -429,9 +391,14 @@ async function separateToBandPower(mono) {
     input.fill(0);
     const framesInChunk = Math.min(CHUNK_FRAMES, totalFrames - c * CHUNK_FRAMES);
     for (let j = 0; j < framesInChunk; j++) {
+      const f = c * CHUNK_FRAMES + j;
       // mono duplicated into both model channels
-      stftFrameMag(fft, window, mono, mono, c * CHUNK_FRAMES + j,
-                   magL, magR, sre, sim);
+      stftFrameMag(fft, window, mono, mono, f, magL, magR, sre, sim);
+      let mp = 0;
+      for (let k = BAND_LO; k <= BAND_HI; k++) {
+        mp += magL[k] * magL[k] + magR[k] * magR[k];
+      }
+      mixPower[f] = mp;
       for (let k = 0; k < NB_BINS; k++) {
         input[k * CHUNK_FRAMES + j] = magL[k];
         input[plane + k * CHUNK_FRAMES + j] = magR[k];
@@ -458,7 +425,7 @@ async function separateToBandPower(mono) {
     }
     await yieldToUI();
   }
-  return { vocalPower, stftSec, inferSec };
+  return { vocalPower, mixPower, stftSec, inferSec };
 }
 
 // ---------------------------------------------------------------------------
@@ -546,10 +513,20 @@ function currentOffsetDb() {
   return Number.isFinite(v) ? v : 20;
 }
 
+function currentRatioDb() {
+  const v = parseFloat($("ratio-db").value);
+  return Number.isFinite(v) ? v : RATIO_OFFSET_DB;
+}
+
 function analyzeEnvelope() {
-  const offsetDb = currentOffsetDb();
   const env = state.envelope;
-  const det = detectOnsetsOffset(env.times, env.db, SONG_OFFSET, offsetDb);
+  const detAbs = detectOnsets(env.times, env.db, SONG_OFFSET, currentOffsetDb());
+  const detRatio = detectOnsets(state.envelopeRatio.times, state.envelopeRatio.db,
+                                SONG_OFFSET, currentRatioDb());
+  const gated = andCombineOnsets(detAbs.onsets, detRatio.onsets);
+  const det = { ...detAbs, onsets: gated, ratio: detRatio };
+  logLine(`abs ${detAbs.onsets.length} · ratio ${detRatio.onsets.length} · ` +
+          `AND(±${AND_MATCH_SEC}s) ${gated.length} onsets`);
   const duration = state.resampled.length / SR;
 
   const badge = $("provider");
@@ -561,17 +538,22 @@ function analyzeEnvelope() {
   $("r-onsets").textContent =
     det.onsets.length ? det.onsets.map((t) => `${t.toFixed(2)}s`).join(", ") : "(none)";
   $("r-thresh").textContent =
-    `${det.baselineDb === null ? "-" : det.baselineDb.toFixed(1)} / ` +
+    `abs ${det.baselineDb === null ? "-" : det.baselineDb.toFixed(1)} / ` +
     `${det.thresholdDb === Infinity ? "-" : det.thresholdDb.toFixed(1)} dB ` +
-    `(offset +${currentOffsetDb().toFixed(0)})`;
+    `(+${currentOffsetDb().toFixed(0)}) · ratio ` +
+    `${det.ratio.baselineDb === null ? "-" : det.ratio.baselineDb.toFixed(1)} / ` +
+    `${det.ratio.thresholdDb === Infinity ? "-" : det.ratio.thresholdDb.toFixed(1)} dB ` +
+    `(+${currentRatioDb().toFixed(0)})`;
   const t = state.timings;
   $("r-total").textContent = fmtSec(t.stftSec + t.inferSec + t.detectSec);
   $("r-rtf").textContent = `${((t.stftSec + t.inferSec + t.detectSec) / duration).toFixed(3)}×`;
   $("env-info").textContent =
-    `Detector: baseline median of first ${BASELINE_WINDOW_SEC.toFixed(0)}s of the recording ` +
-    `+ ${currentOffsetDb().toFixed(0)} dB · 1.0s smoothing · ${SUSTAIN_WINDOW_SEC.toFixed(0)}s ` +
-    `sustain median within ${SUSTAIN_TOLERANCE_DB.toFixed(0)} dB · vocal band ` +
-    `${BAND_LO_HZ}–${BAND_HI_HZ} Hz · onnxruntime-web@${ORT_VERSION}`;
+    `Detector: AND gate = energy (+${currentOffsetDb().toFixed(0)} dB) ∧ vocal/mix ` +
+    `ratio (+${currentRatioDb().toFixed(0)} dB) within ±${AND_MATCH_SEC}s · baseline ` +
+    `median of first ${BASELINE_WINDOW_SEC.toFixed(0)}s of the recording · 1.0s ` +
+    `smoothing · ${SUSTAIN_WINDOW_SEC.toFixed(0)}s sustain within ` +
+    `${SUSTAIN_TOLERANCE_DB.toFixed(0)} dB · vocal band ${BAND_LO_HZ}–${BAND_HI_HZ} Hz · ` +
+    `onnxruntime-web@${ORT_VERSION}`;
   $("results").style.display = "block";
 
   drawPlot(state.envelope, det, duration);
@@ -637,10 +619,17 @@ async function recordAndAnalyze() {
     const t0 = performance.now();
     const sep = await separateToBandPower(state.resampled);
 
-    setStatus("Building envelope + detecting onsets…");
+    setStatus("Building envelopes + detecting onsets…");
     const tDet = performance.now();
-    const raw = powerToEnvelopeDb(sep.vocalPower, SR);
-    state.envelope = smoothEnvelope(raw.times, raw.db);
+    const rawAbs = powerToEnvelopeDb(sep.vocalPower, SR);
+    state.envelope = smoothEnvelope(rawAbs.times, rawAbs.db);
+    const ratio = new Float64Array(sep.vocalPower.length);
+    for (let i = 0; i < ratio.length; i++) {
+      ratio[i] = Math.max(sep.vocalPower[i], 1e-24) /
+                 Math.max(sep.mixPower[i], 1e-24);
+    }
+    const rawRatio = powerToEnvelopeDb(ratio, SR);
+    state.envelopeRatio = smoothEnvelope(rawRatio.times, rawRatio.db);
     state.timings = {
       stftSec: sep.stftSec,
       inferSec: sep.inferSec,

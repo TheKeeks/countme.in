@@ -19,10 +19,11 @@
 
 import {
   FFT, N_FFT, HOP, NB_BINS, hannWindow, stftFrameMag, numFrames,
-  powerToEnvelopeDb, smoothEnvelope, detectOnsets, loadSections,
-  scoreSections, verdict,
-  SONG_OFFSET, BASELINE_WINDOW_SEC, AUTO_OFFSET_DB,
-  SUSTAIN_WINDOW_SEC, SUSTAIN_TOLERANCE_DB, VERDICT_TOLERANCE_SEC,
+  powerToEnvelopeDb, smoothEnvelope, detectOnsets, andCombineOnsets,
+  loadSections, scoreSections, verdict,
+  SONG_OFFSET, BASELINE_WINDOW_SEC, AUTO_OFFSET_DB, RATIO_OFFSET_DB,
+  AND_MATCH_SEC, SUSTAIN_WINDOW_SEC, SUSTAIN_TOLERANCE_DB,
+  VERDICT_TOLERANCE_SEC,
 } from "./dsp.js";
 
 // Same onnxruntime-web version as the other bench pages.
@@ -238,6 +239,7 @@ async function separateToBandPower(audio) {
   const plane = NB_BINS * CHUNK_FRAMES;
   const input = new Float32Array(2 * plane); // reused across chunks
   const vocalPower = new Float64Array(totalFrames);
+  const mixPower = new Float64Array(totalFrames); // for the ratio gate
 
   let stftSec = 0, inferSec = 0;
   for (let c = 0; c < nChunks; c++) {
@@ -246,8 +248,13 @@ async function separateToBandPower(audio) {
     input.fill(0);
     const framesInChunk = Math.min(CHUNK_FRAMES, totalFrames - c * CHUNK_FRAMES);
     for (let j = 0; j < framesInChunk; j++) {
-      stftFrameMag(fft, window, left, right, c * CHUNK_FRAMES + j,
-                   magL, magR, sre, sim);
+      const f = c * CHUNK_FRAMES + j;
+      stftFrameMag(fft, window, left, right, f, magL, magR, sre, sim);
+      let mp = 0;
+      for (let k = BAND_LO; k <= BAND_HI; k++) {
+        mp += magL[k] * magL[k] + magR[k] * magR[k];
+      }
+      mixPower[f] = mp;
       for (let k = 0; k < NB_BINS; k++) {
         input[k * CHUNK_FRAMES + j] = magL[k];
         input[plane + k * CHUNK_FRAMES + j] = magR[k];
@@ -279,7 +286,7 @@ async function separateToBandPower(audio) {
     }
     await yieldToUI();
   }
-  return { vocalPower, stftSec, inferSec };
+  return { vocalPower, mixPower, stftSec, inferSec };
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +391,10 @@ function renderResults(audio, timings, det, rows, env, sections) {
   $("r-onsets").textContent =
     det.onsets.length ? det.onsets.map((t) => `${t.toFixed(1)}s`).join(", ") : "(none)";
   $("r-thresh").textContent =
-    `${det.baselineDb === null ? "-" : det.baselineDb.toFixed(1)} / ${det.thresholdDb.toFixed(1)} dB`;
+    `abs ${det.baselineDb === null ? "-" : det.baselineDb.toFixed(1)} / ` +
+    `${det.thresholdDb.toFixed(1)} dB · ratio ` +
+    `${det.ratio.baselineDb === null ? "-" : det.ratio.baselineDb.toFixed(1)} / ` +
+    `${det.ratio.thresholdDb.toFixed(1)} dB`;
 
   // Verdict: the two anchors the live re-anchoring depends on.
   const lines = [];
@@ -421,9 +431,11 @@ function renderResults(audio, timings, det, rows, env, sections) {
   drawPlot(env, det, sections, audio.duration);
 
   $("env-info").textContent =
-    `Detector: song offset ${SONG_OFFSET.toFixed(1)}s · baseline median of first ` +
-    `${BASELINE_WINDOW_SEC.toFixed(0)}s + ${AUTO_OFFSET_DB.toFixed(0)} dB · 1.0s smoothing · ` +
-    `${SUSTAIN_WINDOW_SEC.toFixed(0)}s sustain median within ${SUSTAIN_TOLERANCE_DB.toFixed(0)} dB · ` +
+    `Detector: song offset ${SONG_OFFSET.toFixed(1)}s · AND gate = energy ` +
+    `(baseline+${AUTO_OFFSET_DB.toFixed(0)} dB) ∧ vocal/mix ratio ` +
+    `(baseline+${RATIO_OFFSET_DB.toFixed(0)} dB) within ±${AND_MATCH_SEC}s · ` +
+    `baseline = median of first ${BASELINE_WINDOW_SEC.toFixed(0)}s · 1.0s smoothing · ` +
+    `${SUSTAIN_WINDOW_SEC.toFixed(0)}s sustain within ${SUSTAIN_TOLERANCE_DB.toFixed(0)} dB · ` +
     `WebGPU adapter: ${state.adapterDesc} · onnxruntime-web@${ORT_VERSION}`;
   $("results").style.display = "block";
 }
@@ -451,14 +463,32 @@ async function run() {
 
     const sep = await separateToBandPower(state.audio);
 
-    setStatus("Building envelope + detecting onsets…");
+    setStatus("Building envelopes + detecting onsets (AND gate)…");
     const t0 = performance.now();
-    const raw = powerToEnvelopeDb(sep.vocalPower, SR);
-    const env = smoothEnvelope(raw.times, raw.db);
-    const det = detectOnsets(env.times, env.db, SONG_OFFSET);
+    // Gate 1: absolute vocal-band energy.
+    const rawAbs = powerToEnvelopeDb(sep.vocalPower, SR);
+    const env = smoothEnvelope(rawAbs.times, rawAbs.db);
+    const detAbs = detectOnsets(env.times, env.db, SONG_OFFSET, AUTO_OFFSET_DB);
+    // Gate 2: vocal-to-mix ratio — the fraction of room energy the model
+    // attributes to voice. Jam leak scales with band loudness and fails
+    // this gate; real vocal entries pass both.
+    const ratio = new Float64Array(sep.vocalPower.length);
+    for (let i = 0; i < ratio.length; i++) {
+      ratio[i] = Math.max(sep.vocalPower[i], 1e-24) /
+                 Math.max(sep.mixPower[i], 1e-24);
+    }
+    const rawRatio = powerToEnvelopeDb(ratio, SR);
+    const envRatio = smoothEnvelope(rawRatio.times, rawRatio.db);
+    const detRatio = detectOnsets(envRatio.times, envRatio.db, SONG_OFFSET,
+                                  RATIO_OFFSET_DB);
+    const gated = andCombineOnsets(detAbs.onsets, detRatio.onsets);
+    const det = { ...detAbs, onsets: gated, ratio: detRatio };
     const detectSec = (performance.now() - t0) / 1000;
-    logLine(`baseline ${det.baselineDb?.toFixed(1)} dB, threshold ` +
-            `${det.thresholdDb.toFixed(1)} dB, ${det.onsets.length} onsets`);
+    logLine(`abs gate: baseline ${detAbs.baselineDb?.toFixed(1)} dB, threshold ` +
+            `${detAbs.thresholdDb.toFixed(1)} dB, ${detAbs.onsets.length} onsets`);
+    logLine(`ratio gate: baseline ${detRatio.baselineDb?.toFixed(1)} dB, threshold ` +
+            `${detRatio.thresholdDb.toFixed(1)} dB, ${detRatio.onsets.length} onsets`);
+    logLine(`AND gate (±${AND_MATCH_SEC}s): ${gated.length} onsets`);
 
     const rows = scoreSections(state.gt, det.onsets);
     renderResults(state.audio, { ...sep, decodeSec: state.audio.decodeSec, detectSec },

@@ -199,6 +199,16 @@ export function smoothEnvelope(times, db) {
 export const SONG_OFFSET = 20.0;
 export const BASELINE_WINDOW_SEC = 8.0;
 export const AUTO_OFFSET_DB = 20.0;
+// Second gate: vocal-to-mix RATIO envelope offset. Tuned on the real band
+// recording (parameter sweep, 2026-07-14): energy-only detection at any
+// threshold leaves 5-14 false onsets inside the jam (Open-Unmix leak tracks
+// band loudness), but requiring BOTH the absolute vocal-band energy gate
+// (+20 dB) AND the vocal/mix ratio gate (+5 dB) to fire within
+// AND_MATCH_SEC gives 0 jam false positives with verse_1 at +0.4s and
+// verse_5 at +4.0s (inside the ±5s re-anchor tolerance). Stable across
+// ABS +20..24 dB; RATIO +4 loses verse_5, +6 readmits a jam FP.
+export const RATIO_OFFSET_DB = 5.0;
+export const AND_MATCH_SEC = 1.5;
 export const SUSTAIN_WINDOW_SEC = 2.0;
 export const SUSTAIN_TOLERANCE_DB = 5.0;
 export const VERDICT_TOLERANCE_SEC = 5.0;
@@ -210,7 +220,8 @@ function median(values) {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
-export function detectOnsets(times, db, songOffset = SONG_OFFSET) {
+export function detectOnsets(times, db, songOffset = SONG_OFFSET,
+                             offsetDb = AUTO_OFFSET_DB) {
   const baseVals = [];
   for (let i = 0; i < times.length; i++) {
     if (times[i] >= songOffset && times[i] < songOffset + BASELINE_WINDOW_SEC) {
@@ -218,7 +229,7 @@ export function detectOnsets(times, db, songOffset = SONG_OFFSET) {
     }
   }
   const baselineDb = median(baseVals);
-  const thresholdDb = baselineDb === null ? Infinity : baselineDb + AUTO_OFFSET_DB;
+  const thresholdDb = baselineDb === null ? Infinity : baselineDb + offsetDb;
 
   const dt = times.length > 1 ? times[1] - times[0] : ENV_FRAME_SEC;
   const windowFrames = Math.max(1, Math.ceil(SUSTAIN_WINDOW_SEC / dt));
@@ -246,6 +257,16 @@ export function detectOnsets(times, db, songOffset = SONG_OFFSET) {
   if (intervalStart !== null && n > 0) intervals.push([intervalStart, times[n - 1]]);
 
   return { baselineDb, thresholdDb, onsets, intervals };
+}
+
+/**
+ * Two-feature AND gate: keep only the absolute-energy onsets that have a
+ * ratio-envelope onset within `matchSec`. The gated onset keeps the
+ * energy-onset timestamp (the sharper of the two edges).
+ */
+export function andCombineOnsets(absOnsets, ratioOnsets, matchSec = AND_MATCH_SEC) {
+  return absOnsets.filter((a) =>
+    ratioOnsets.some((r) => Math.abs(r - a) <= matchSec));
 }
 
 // ---------------------------------------------------------------------------

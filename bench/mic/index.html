@@ -74,8 +74,10 @@
 
 <button id="record">● Record</button>
 <div class="controls">
-  <label for="offset-db">Threshold offset (dB above baseline):</label>
+  <label for="offset-db">Energy gate (dB):</label>
   <input id="offset-db" type="number" value="20" step="1" min="3" max="60">
+  <label for="ratio-db">Ratio gate (dB):</label>
+  <input id="ratio-db" type="number" value="5" step="1" min="1" max="30">
   <button id="reanalyze" disabled>Re-analyze</button>
   <button id="play" disabled>▶ Play recording</button>
 </div>

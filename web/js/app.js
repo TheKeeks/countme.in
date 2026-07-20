@@ -77,9 +77,20 @@ async function openSong(songId) {
   buildEmergencyList(template, onEmergencyLineSelected);
 
   // Position tracker + audio engine are constructed but not started.
-  // The user has to tap the mic button to begin tracking.
-  state.tracker = new PositionTracker(template);
-  state.tracker.onPositionChange = ({ sectionId, lineIndex, confidence }) => {
+  // The user has to tap the mic button to begin tracking. The chroma
+  // reference and vocal head are per-song optional resources: missing
+  // files just degrade the tracker to its timer stub.
+  const resources = {};
+  try {
+    const r = await fetch(`templates/${songId}_chroma.json`);
+    if (r.ok) resources.chroma = await r.json();
+  } catch { /* offline or absent — tracker falls back */ }
+  try {
+    const r = await fetch(`templates/${songId}_vocal_head.json`);
+    if (r.ok) resources.vocalHead = await r.json();
+  } catch { /* optional */ }
+  state.tracker = new PositionTracker(template, resources);
+  state.tracker.onPositionChange = ({ sectionId, lineIndex }) => {
     setCurrentLine(sectionId, lineIndex);
     updateTrackingStatus(state.tracker.state);
   };

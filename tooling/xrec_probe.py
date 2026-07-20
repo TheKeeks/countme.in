@@ -114,9 +114,14 @@ def _expected_row(onsets: list[float], expected: Optional[float],
 
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    p.add_argument("--train-audio", type=Path, required=True)
+    p.add_argument("--train-audio", type=Path, required=True,
+                   action="append",
+                   help="TRAIN recording. Repeat the flag (paired with "
+                        "--train-ground-truth) to train on several takes.")
     p.add_argument("--train-ground-truth", type=Path, required=True,
-                   help="Labeled sections for the TRAIN recording.")
+                   action="append",
+                   help="Labeled sections for the corresponding "
+                        "--train-audio (same order).")
     p.add_argument("--test-audio", type=Path, required=True)
     p.add_argument("--expected-verse-1-sec", type=float, default=None,
                    help="Known first-verse vocal start in the TEST "
@@ -131,19 +136,36 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--output-json", type=Path, default=Path("xrec_probe.json"))
     args = p.parse_args(argv)
 
-    print(f"Extracting mel features: train ({args.train_audio}) ...",
-          flush=True)
-    x_train, _c1, t_train, d_train = _extract(args.train_audio,
-                                              args.window_sec)
-    sections = _load_sections(args.train_ground_truth)
-    _sids, labels = _window_labels(sections, t_train, args.window_sec)
-    labeled = labels >= 0
-    print(f"  {d_train:.1f}s, {int((labels == 1).sum())} vocal / "
-          f"{int((labels == 0).sum())} instrumental windows", flush=True)
+    if len(args.train_audio) != len(args.train_ground_truth):
+        p.error("--train-audio and --train-ground-truth must be given the "
+                "same number of times, in matching order")
 
-    print("Training mel head on the full train recording ...", flush=True)
+    train_x_parts: list[np.ndarray] = []
+    train_y_parts: list[np.ndarray] = []
+    train_meta: list[dict] = []
+    for audio, gt in zip(args.train_audio, args.train_ground_truth):
+        print(f"Extracting mel features: train ({audio}) ...", flush=True)
+        x_i, _c, t_i, d_i = _extract(audio, args.window_sec)
+        sections = _load_sections(gt)
+        _sids, labels = _window_labels(sections, t_i, args.window_sec)
+        labeled = labels >= 0
+        n_voc = int((labels == 1).sum())
+        n_ins = int((labels == 0).sum())
+        print(f"  {d_i:.1f}s, {n_voc} vocal / {n_ins} instrumental windows",
+              flush=True)
+        train_x_parts.append(x_i[labeled])
+        train_y_parts.append(labels[labeled])
+        train_meta.append({"audio": str(audio), "ground_truth": str(gt),
+                           "duration_sec": d_i, "vocal_windows": n_voc,
+                           "instrumental_windows": n_ins})
+    x_train = np.concatenate(train_x_parts)
+    y_train = np.concatenate(train_y_parts)
+    d_train = sum(m["duration_sec"] for m in train_meta)
+
+    print(f"Training mel head on {len(train_meta)} recording(s) "
+          f"({len(y_train)} labeled windows) ...", flush=True)
     clf = _new_clf()
-    clf.fit(x_train[labeled], labels[labeled])
+    clf.fit(x_train, y_train)
 
     print(f"Extracting mel features: test ({args.test_audio}) ...",
           flush=True)
@@ -181,11 +203,13 @@ def main(argv: Optional[list[str]] = None) -> int:
               + (" | " + " | ".join(parts) if parts else ""), flush=True)
 
     # Markdown.
+    train_desc = "; ".join(
+        f"`{m['audio']}` with `{m['ground_truth']}`" for m in train_meta)
     md = [
         "# Cross-recording probe (rung 3b, no separation)",
         "",
-        f"- Train: `{args.train_audio}` ({d_train:.1f}s) with "
-        f"`{args.train_ground_truth}`",
+        f"- Train ({len(train_meta)} recording(s), {d_train:.1f}s total): "
+        f"{train_desc}",
         f"- Test: `{args.test_audio}` ({d_test:.1f}s) -- never seen in "
         "training",
         f"- Features: 64-band log-mel mean+std per {args.window_sec:.1f}s "
@@ -229,8 +253,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"Wrote markdown report to {args.output_md}", flush=True)
 
     report = {
-        "train_audio": str(args.train_audio),
-        "train_ground_truth": str(args.train_ground_truth),
+        "train_recordings": train_meta,
         "train_duration_sec": d_train,
         "test_audio": str(args.test_audio),
         "test_duration_sec": d_test,

@@ -1,0 +1,17 @@
+{
+  "song_id": "peggy_o",
+  "audio_source": "band_recording_3",
+  "labeled_by": "band_recall_approx",
+  "song_offset_sec": 2.0,
+  "notes": "Third band take (Peggy-1.m4a, ~66kbps AAC, 356.2s). Fastest and hottest mix of the three takes; vocal sits noticeably lower relative to the band (rung-3 mel head AUC drops to ~0.62 here vs ~0.96 on take 2 -- the current hard test case). Confirmed by the band: first sung line at 0:18, guitar solo starts 2:20 (vocals end a few beats before), 'if ever I return' re-entry at 3:45, and Corby's shouted 'damn' at ~3:15 during the solo (mel raw curve shows vocal-like bursts at 3:12 and 3:19-3:21). The _damn section excludes that window from the instrumental class. End-of-vocals (~5:40) inferred, not confirmed. Block sections named verse_1 / verse_5 so probe anchor logic works: only their START times are confirmed; each block spans four verses.",
+  "sections": [
+    {"section_id": "_talk",   "start": 0,   "end": 2,    "lyric_cue": null, "notes": "Someone talking right at the top of the recording"},
+    {"section_id": "intro_1", "start": 2,   "end": 18,   "lyric_cue": null, "notes": "Short fast intro"},
+    {"section_id": "verse_1", "start": 18,  "end": 137,  "lyric_cue": "as we rode out", "notes": "Verses 1-4 block; start confirmed by band (0:18), end = a few beats before the 2:20 solo"},
+    {"section_id": "jam_1",   "start": 140, "end": 190,  "lyric_cue": null, "notes": "Guitar solo, first part"},
+    {"section_id": "_damn",   "start": 190, "end": 202,  "lyric_cue": null, "notes": "Corby's 'damn' (~3:15 per band, vocal bursts at 3:12 / 3:19-3:21 in the mel curve). Excluded so the shout never trains as 'instrumental'."},
+    {"section_id": "jam_2",   "start": 202, "end": 225,  "lyric_cue": null, "notes": "Solo continues to the re-entry"},
+    {"section_id": "verse_5", "start": 225, "end": 340,  "lyric_cue": "if ever I return", "notes": "Verses 5-8 block; start confirmed by band (3:45), end inferred (~5:40)"},
+    {"section_id": "_tail",   "start": 340, "end": 9999, "lyric_cue": null, "notes": "Post-vocals; exclude from training/accuracy"}
+  ]
+}

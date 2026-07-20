@@ -1,0 +1,15 @@
+{
+  "song_id": "peggy_o",
+  "audio_source": "band_recording_2",
+  "labeled_by": "band_recall_approx",
+  "song_offset_sec": 30.0,
+  "notes": "Second band take (Peggy.m4a, ~66kbps AAC, 408.6s). Higher pace/energy than the Feb 26 take; bassist off that day. Confirmed by the band: first sung line at 0:56, 'if ever I return' re-entry at 5:03 (muffled vocal on re-entry). Other boundaries are approximate: intro start ~0:30 per band recall; vocals-end-before-jam (~2:58) and end-of-vocals (~6:40) inferred from the rung-3 mel P(vocal) curve. Block sections named verse_1 / verse_5 so probe anchor logic works: only their START times are confirmed per-verse boundaries; each block spans four verses. 178-181s left unlabeled as a guard band around the inferred vocals->jam boundary.",
+  "sections": [
+    {"section_id": "_noodling", "start": 0,   "end": 30,   "lyric_cue": null, "notes": "Pre-song; intro starts ~0:30 per band recall"},
+    {"section_id": "intro_1",   "start": 30,  "end": 56,   "lyric_cue": null},
+    {"section_id": "verse_1",   "start": 56,  "end": 178,  "lyric_cue": "as we rode out", "notes": "Verses 1-4 block; start confirmed by band (0:56), end inferred (vocals wind down ~2:58)"},
+    {"section_id": "jam_1",     "start": 181, "end": 303,  "lyric_cue": null, "notes": "Start inferred (guard band 178-181 unlabeled); end confirmed by band"},
+    {"section_id": "verse_5",   "start": 303, "end": 400,  "lyric_cue": "if ever I return", "notes": "Verses 5-8 block; start confirmed by band (5:03, muffled re-entry), end inferred (~6:40)"},
+    {"section_id": "_tail",     "start": 400, "end": 9999, "lyric_cue": null, "notes": "Post-vocals; exclude from training/accuracy"}
+  ]
+}

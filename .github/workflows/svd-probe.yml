@@ -1,0 +1,132 @@
+name: Singing-voice probe
+
+# Rung 3 of the live vocal-onset ladder: is sung-vocal presence linearly
+# decodable from raw phone-mic audio using log-mel features (live-viable
+# baseline) and MERT embeddings (signal ceiling)? Labels come from the
+# hand-labeled ground-truth sections. Deliberately NO Demucs / source
+# separation anywhere -- not even for labeling.
+
+on:
+  workflow_dispatch:
+    inputs:
+      audio_url:
+        description: 'Direct download URL for audio (Dropbox ?dl=0 auto-flipped to ?dl=1)'
+        required: true
+        type: string
+      song_id:
+        description: 'Song id, used to locate the default ground-truth file'
+        required: true
+        type: string
+        default: peggy_o
+      ground_truth_path:
+        description: 'Ground-truth JSON path (default: tooling/ground_truth/{song_id}_band.json)'
+        required: false
+        type: string
+        default: ''
+      song_offset:
+        description: 'Ignore audio before this time, in seconds (pre-song noodling)'
+        required: false
+        type: number
+        default: 20.0
+      features:
+        description: 'Which feature sets to probe'
+        required: false
+        type: choice
+        default: both
+        options:
+          - both
+          - mel
+          - mert
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Run singing-voice probe
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Cache MERT model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-mert-v1-95m-${{ runner.os }}-v1
+
+      - name: Install Python deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # CPU-only torch first so transformers doesn't drag in the
+          # multi-GB CUDA wheels.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "transformers>=4.40" "scikit-learn>=1.3" \
+            "librosa>=0.10" "soundfile>=0.12" "scipy>=1.10" "numpy>=1.24" \
+            "nnAudio>=0.3"
+
+      - name: Download audio
+        env:
+          AUDIO_URL: ${{ inputs.audio_url }}
+        run: |
+          set -euo pipefail
+          url="$AUDIO_URL"
+          if [[ "$url" == *"dropbox.com"* ]]; then
+            url="${url/?dl=0/?dl=1}"
+            case "$url" in
+              *\?dl=1*) ;;
+              *\?*) url="${url}&dl=1" ;;
+              *) url="${url}?dl=1" ;;
+            esac
+          fi
+          mkdir -p svd
+          echo "Downloading audio from: $url"
+          # No extension on purpose: svd_probe re-encodes via ffmpeg.
+          curl -L --fail --max-time 600 -o svd/audio "$url"
+          ls -la svd/audio
+
+      - name: Run singing-voice probe
+        env:
+          SONG_ID: ${{ inputs.song_id }}
+          GT_PATH: ${{ inputs.ground_truth_path }}
+          SONG_OFFSET: ${{ inputs.song_offset }}
+          FEATURES: ${{ inputs.features }}
+        run: |
+          set -euo pipefail
+          gt_path="${GT_PATH:-tooling/ground_truth/${SONG_ID}_band.json}"
+          python tooling/svd_probe.py \
+            --audio svd/audio \
+            --ground-truth "$gt_path" \
+            --song-offset "$SONG_OFFSET" \
+            --features "$FEATURES" \
+            --output-md svd/svd_probe.md \
+            --output-json svd/svd_probe.json | tee svd/stdout.txt
+
+      - name: Append report to job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f svd/svd_probe.md ]]; then
+            cat svd/svd_probe.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: svd-probe-report
+          path: svd/
+          if-no-files-found: warn
+          retention-days: 30

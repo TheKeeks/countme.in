@@ -11,7 +11,7 @@
  * existing client caches.
  */
 
-const CACHE_VERSION = 'v2';
+const CACHE_VERSION = 'v3';
 const SHELL_CACHE = `countme-in-shell-${CACHE_VERSION}`;
 const ASSET_CACHE = `countme-in-assets-${CACHE_VERSION}`;
 const MODEL_CACHE = `countme-in-models-${CACHE_VERSION}`;
@@ -26,6 +26,7 @@ const SHELL_FILES = [
   './js/display.js',
   './js/position-tracker.js',
   './js/audio-engine.js',
+  './js/vocal-onset.js',
   './icons/icon-192.png',
   './icons/icon-512.png',
 ];

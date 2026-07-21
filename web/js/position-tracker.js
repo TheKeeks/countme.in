@@ -40,6 +40,22 @@ const VOCAL_KAPPA = 6.0;  // vocal-consistency weight (scaled by gate)
 const LOCK_CONFIDENCE = 0.6;
 const LOST_CONFIDENCE = 0.2;
 const CONFIDENCE_WINDOW_SEC = 10.0;
+// A prompter should essentially never scroll backwards on its own: verses
+// are chroma-identical, so the posterior's argmax can flip between "still
+// in verse N" and "into verse N+1" hypotheses (field-tested failure: the
+// display snapped from verse 2 back to verse 1 line 1 mid-song). Forward
+// moves are emitted immediately; backward moves require BOTH sustained
+// backward evidence AND the backward mode to decisively dominate the
+// posterior mass near the currently displayed position. The user's
+// snapTo bypasses this.
+const BACKWARD_HOLD_STEPS = 6;      // 3 s at 2 Hz
+// The raw argmax races ahead within a verse (its lines are musically
+// near-identical) and then corrects back — the display would wobble
+// forward/backward by a few lines. Emitting the MEDIAN of the recent
+// argmax positions filters the race-and-correct spikes; sustained moves
+// pass through as one clean change ~1 s later.
+const EMIT_MEDIAN_STEPS = 5;
+const BACKWARD_SUPPRESS_LINES = 3; // never show backward hops this small
 
 const MEDIUM_COST = [-2.0, -1.0, -0.5, -1.0, -1.2, -1.5, -1.8, -2.0, -2.2];
 const HIGH_COST = [-0.7, -0.9, -1.1, -1.3, -1.5, -1.7, -1.9, -1e9, -1e9];
@@ -152,6 +168,8 @@ export class PositionTracker {
   start() {
     this.state = 'listening';
     this._currentIndex = -1;
+    this._backSteps = 0;
+    this._recentBest = [];
     if (!this._live) {
       // Legacy stub: timer-based advancement.
       this._startTime = performance.now() / 1000;
@@ -187,6 +205,7 @@ export class PositionTracker {
     );
     if (idx < 0) return;
     this._currentIndex = idx;
+    this._backSteps = 0;
     const line = this._flatLines[idx];
     if (this._live && this._live.logp) {
       // Concentrate posterior mass at the tapped line (±2 s), all rates.
@@ -302,7 +321,13 @@ export class PositionTracker {
     this.state = confidence >= LOCK_CONFIDENCE ? 'locked'
       : confidence <= LOST_CONFIDENCE ? 'lost' : 'listening';
 
-    const refTime = bestI * STEP_SEC;
+    // Median-of-recent argmax for a stable display position.
+    if (!this._recentBest) this._recentBest = [];
+    this._recentBest.push(bestI);
+    if (this._recentBest.length > EMIT_MEDIAN_STEPS) this._recentBest.shift();
+    const sorted = [...this._recentBest].sort((a, b) => a - b);
+    const medianI = sorted[Math.floor(sorted.length / 2)];
+    const refTime = medianI * STEP_SEC;
     // Current line: containing line, else the next upcoming one (so the
     // display shows what's coming during instrumental sections).
     let idx = this._flatLines.findIndex(
@@ -312,12 +337,26 @@ export class PositionTracker {
         l => l.startSec != null && l.startSec >= refTime);
       if (idx < 0) idx = this._flatLines.length - 1;
     }
+    if (idx < this._currentIndex) {
+      // Small backward corrections (a few lines, race-and-correct within
+      // a verse) are never shown: the display renders lookahead anyway,
+      // so briefly being a line ahead is harmless while a backward hop is
+      // visibly disruptive. Forward motion resumes on its own. Large
+      // backward moves mean genuine relocalization and pass after
+      // sustained evidence.
+      if (this._currentIndex - idx <= BACKWARD_SUPPRESS_LINES) return;
+      this._backSteps = (this._backSteps || 0) + 1;
+      if (this._backSteps < BACKWARD_HOLD_STEPS) return;
+    } else {
+      this._backSteps = 0;
+    }
     if (idx !== this._currentIndex) {
+      this._backSteps = 0;
       this._currentIndex = idx;
       const l = this._flatLines[idx];
       if (l && this.onPositionChange) {
         this.onPositionChange({
-          sectionId: lv.sectionOf[Math.min(bestI, n - 1)] ?? l.sectionId,
+          sectionId: l.sectionId,
           lineIndex: l.lineIndex,
           confidence,
         });

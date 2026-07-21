@@ -83,9 +83,17 @@ the legacy timer stub.
 
 - Per-verse identity within a repeated-verse block rests on the rate
   model, not on the observations; a band that drastically changes
-  tempo mid-verse-block will smear it. The Whisper/ASR term from the
-  original architecture sketch remains unintegrated (probes showed
-  weak ASR on band audio) and would be the natural disambiguator.
+  tempo mid-verse-block will smear it. The natural disambiguator is
+  lyric recognition, but rung 4 (tooling/word_anchor_probe.py)
+  falsified it on the current recordings: Whisper on the raw band mix
+  produces pure hallucination loops at tiny.en/base.en (zero real
+  words) and at small.en catches one real phrase ("will you marry me")
+  then loops it across the whole recording -- anchors from it would be
+  wrong-verse hits everywhere. The blocker is the same one rungs 1-2
+  hit: the vocal sits very low in these room recordings. Re-run the
+  probe if a vocal-forward capture (phone at the deployment position,
+  near the vocal mic) becomes available -- that geometry is the
+  untested variable.
 - Single song validated so far (three takes). The pipeline is
   per-song by construction; new songs need the two export steps above.
 - The verse-5 hold depends on the vocal head's gate opening; on

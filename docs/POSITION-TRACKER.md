@@ -99,10 +99,14 @@ the legacy timer stub.
   of 8) and jam windows score in the same range as real verses -- the
   verse-identity information is simply not present in these
   recordings at any feature level. Words cannot be recovered by any
-  model, trained or parsed, if the audio doesn't carry them. Re-run
-  both probes when a vocal-forward capture (phone at the deployment
-  position, near the vocal mic) becomes available -- capture geometry
-  is the untested variable and the actual bottleneck.
+  model, trained or parsed, if the audio doesn't carry them. And the
+  recordings ARE deployment audio -- band-confirmed as captured from
+  the mic-stand position, the best available -- so word-level anchors
+  are infeasible for this deployment, not merely untested. The only
+  route to lyric anchors would be a direct feed (vocal channel from
+  the mixer into the device); with mic-stand air capture, the
+  vocal-presence head is the strongest voice signal extractable and
+  exact-verse identity rests on the rate model.
 - Single song validated so far (three takes). The pipeline is
   per-song by construction; new songs need the two export steps above.
 - The verse-5 hold depends on the vocal head's gate opening; on

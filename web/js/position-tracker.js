@@ -13,7 +13,7 @@
  *      P(vocal) high; intro/jam/outro states expect it low. This is
  *      what re-anchors the verse-5 re-entry after the jam.
  *
- * The tempo RATE is a hidden state (7 values, 0.5×–1.75× of the
+ * The tempo RATE is a hidden state (7 values, 0.7×–1.4× of the
  * reference): in low-elasticity sections (verses) the position must
  * advance at the current rate, which stops the tracker drifting
  * through chroma-identical repeated verses; in medium/high sections
@@ -32,7 +32,13 @@ import { ChromaExtractor } from './chroma.js';
 import { VocalOnsetDetector } from './vocal-onset.js';
 
 const STEP_SEC = 0.5;
-const RATES = [0.5, 0.65, 0.8, 1.0, 1.2, 1.45, 1.75];
+// Playback rate relative to the reference. Live steps and reference
+// frames are both STEP_SEC long, so rate r means advancing r reference
+// frames per step. (Before this was fixed the cost was centred on
+// 2*r, so the labelled 0.5x-1.75x grid actually spanned 1.0x-3.5x and
+// had no state slower than the reference.) Measured band takes run
+// ~0.9x-1.1x of the reference; tests/replay --tempo exercises the ends.
+const RATES = [0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4];
 const MAX_D = 8;
 const RATE_SWITCH_COST = 2.5;
 const KAPPA = 8.0;        // chroma observation sharpness
@@ -111,7 +117,7 @@ export class PositionTracker {
         const row = new Float64Array(MAX_D + 1);
         for (let d = 0; d <= MAX_D; d++) {
           if (e === 0) {
-            const x = d - 2 * RATES[ri];
+            const x = d - RATES[ri];
             row[d] = -(x * x) / (2 * 0.7 * 0.7);
           } else {
             row[d] = (e === 1 ? MEDIUM_COST : HIGH_COST)[d];
@@ -170,6 +176,7 @@ export class PositionTracker {
     this._currentIndex = -1;
     this._backSteps = 0;
     this._recentBest = [];
+    this._refIndex = null;
     if (!this._live) {
       // Legacy stub: timer-based advancement.
       this._startTime = performance.now() / 1000;
@@ -224,6 +231,17 @@ export class PositionTracker {
       this.onPositionChange({ sectionId, lineIndex, confidence: 1.0 });
     }
     this.state = 'locked';
+  }
+
+  /** Reference-timeline estimate (seconds) behind the displayed line, or
+   *  null before the first step. Diagnostics / tests/replay harness. */
+  get referenceTime() {
+    return this._refIndex == null ? null : this._refIndex * STEP_SEC;
+  }
+
+  /** Template section containing referenceTime (null in unlabeled gaps). */
+  get referenceSection() {
+    return this._refIndex == null ? null : this._live.sectionOf[this._refIndex];
   }
 
   /** Called by the AudioEngine for each frame. */
@@ -328,6 +346,7 @@ export class PositionTracker {
     const sorted = [...this._recentBest].sort((a, b) => a - b);
     const medianI = sorted[Math.floor(sorted.length / 2)];
     const refTime = medianI * STEP_SEC;
+    this._refIndex = medianI;
     // Current line: containing line, else the next upcoming one (so the
     // display shows what's coming during instrumental sections).
     let idx = this._flatLines.findIndex(

@@ -1,0 +1,26 @@
+{
+  "_comment": "Band takes the replay harness scores the shipped tracker against. audio: repo-relative path, or null when the recording is not committed (supply it with --audio <name>=<path-or-url>). expect: regression floors enforced with --check; block/strict are section accuracies in [0,1], verse5_abs_err_sec bounds |re-entry error|.",
+  "takes": [
+    {
+      "name": "take1",
+      "song": "peggy_o",
+      "audio": "bench/detect/band.mp3",
+      "ground_truth": "tooling/ground_truth/peggy_o_band.json",
+      "expect": { "block": 0.95, "strict": 0.90, "verse5_abs_err_sec": 6.0 }
+    },
+    {
+      "name": "take2",
+      "song": "peggy_o",
+      "audio": null,
+      "ground_truth": "tooling/ground_truth/peggy_o_band2.json",
+      "expect": { "block": 0.92, "verse5_abs_err_sec": 6.0 }
+    },
+    {
+      "name": "take3",
+      "song": "peggy_o",
+      "audio": null,
+      "ground_truth": "tooling/ground_truth/peggy_o_band3.json",
+      "expect": { "block": 0.80 }
+    }
+  ]
+}

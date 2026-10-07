@@ -21,11 +21,14 @@ countme.in/
 │   │   ├── app.js               Entry point + screen routing
 │   │   ├── template-loader.js   Reads /templates/*.json
 │   │   ├── display.js           Lyric rendering & highlighting
-│   │   ├── position-tracker.js  STUB: real DTW/HMM engine goes here (Phase 3)
+│   │   ├── position-tracker.js  Live (position × tempo) HMM — docs/POSITION-TRACKER.md
+│   │   ├── chroma.js            Streaming pitch-class profile from the mic
+│   │   ├── vocal-onset.js       Per-song "is someone singing" detector
 │   │   └── audio-engine.js      Mic capture via Web Audio API
 │   ├── css/style.css          Styling
 │   └── templates/             Aligned song JSONs the app loads at runtime
 │
+├── tests/replay/            Replays band takes through the shipped tracker (CI-gated)
 ├── docs/                    Architecture + how-to docs
 └── .github/workflows/       Auto-deploys web/ to GitHub Pages on push to main
 ```
@@ -36,8 +39,9 @@ countme.in/
   audio features (tempo, beats, chroma, key estimate).
 - ✅ **Phase 2** (aligner): done. Uses faster-whisper to get word-level timestamps,
   fuzzy-matches against expected lyrics, computes per-line chroma fingerprints.
-- 🚧 **Phase 3** (live position tracker): in progress. Stubbed with time-based playback
-  so the UI can be tested end-to-end. Real engine = online DTW + Whisper ASR fusion.
+- 🚧 **Phase 3** (live position tracker): working for Peggy-O. Chroma + vocal-presence
+  HMM in the browser; see `docs/POSITION-TRACKER.md`. Accuracy is regression-tested by
+  `node tests/replay/replay.mjs` (CI: `tracker-replay.yml`).
 - ⏸️ **Phase 4** (production polish): post-MVP. Multi-song setlists, model swapping,
   cloud-Whisper enhancement when Wi-Fi is available.
 

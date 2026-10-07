@@ -1,0 +1,83 @@
+name: Tracker replay
+
+# Replays real band recordings through the shipped web/js tracker and
+# fails if accuracy drops below the floors in tests/replay/takes.json.
+# Take 1's audio is committed (bench/detect/band.mp3), so every push
+# that touches the tracker is checked. Takes 2/3 aren't in the repo:
+# run this manually with their URLs to score them too.
+
+on:
+  push:
+    paths:
+      - 'web/js/**'
+      - 'web/templates/**'
+      - 'tests/replay/**'
+      - 'tooling/ground_truth/**'
+      - '.github/workflows/tracker-replay.yml'
+  pull_request:
+    paths:
+      - 'web/js/**'
+      - 'web/templates/**'
+      - 'tests/replay/**'
+      - 'tooling/ground_truth/**'
+      - '.github/workflows/tracker-replay.yml'
+  workflow_dispatch:
+    inputs:
+      take2_url:
+        description: 'Optional audio URL for take 2 (Peggy.m4a); Dropbox ?dl=0 links are fine'
+        required: false
+        default: ''
+      take3_url:
+        description: 'Optional audio URL for take 3 (Peggy-1.m4a)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Replay takes
+        env:
+          TAKE2_URL: ${{ inputs.take2_url }}
+          TAKE3_URL: ${{ inputs.take3_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p replay
+          extra=()
+          [[ -n "${TAKE2_URL:-}" ]] && extra+=(--audio "take2=$TAKE2_URL")
+          [[ -n "${TAKE3_URL:-}" ]] && extra+=(--audio "take3=$TAKE3_URL")
+          node tests/replay/replay.mjs --check "${extra[@]}" \
+            --md replay/replay.md --json replay/replay.json
+
+      - name: Tempo robustness (take 1 stretched)
+        run: |
+          set -euo pipefail
+          for t in 0.8 1.25; do
+            node tests/replay/replay.mjs --take take1 --tempo "$t" --check \
+              --md "replay/replay_tempo_$t.md"
+          done
+
+      - name: Summary
+        if: always()
+        run: cat replay/*.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracker-replay
+          path: replay/

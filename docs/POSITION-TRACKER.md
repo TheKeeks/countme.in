@@ -34,7 +34,7 @@ there. Tightening per-step speed limits didn't fix it — the drift was
 sustained, not instantaneous.
 
 The fix models what bands actually do: **tempo is consistent within a
-performance**. Rate (7 values, 0.5×–1.75× of reference) is a hidden
+performance**. Rate (7 values, 0.7×–1.4× of reference) is a hidden
 state with a switching cost. In `low`-elasticity sections (verses) the
 position must advance at the current rate each step; in `medium`/`high`
 sections (intro, jam, outro) movement is free — a 53 s reference intro
@@ -42,6 +42,41 @@ can map to a 13 s band intro, and the jam can stretch arbitrarily.
 This took take-1 strict per-verse accuracy from 47% → 95%.
 
 ## Measured results (real band takes, node harness on the shipped JS)
+
+Reproduce with the committed replay harness (needs `ffmpeg`; CI runs
+it on every push touching the tracker — `.github/workflows/tracker-replay.yml`):
+
+```bash
+node tests/replay/replay.mjs                      # take 1 (audio in repo)
+node tests/replay/replay.mjs --audio take2=Peggy.m4a --audio take3=Peggy-1.m4a
+node tests/replay/replay.mjs --take take1 --tempo 0.8   # synthetic slower band
+node tests/replay/replay.mjs --check              # enforce floors in tests/replay/takes.json
+```
+
+It feeds the decoded take from its `song_offset_sec` (when the singer
+taps start) through the real `PositionTracker` in 2048-sample frames
+and scores the per-step reference position. Take 1 through the harness
+after the rate fix: **98.2% block / 94.7% strict / +3.8 s** re-entry
+(+3.8 s here = first entry that holds 10 s). Time-stretched take 1:
+×0.8 → 98.3% / 94.0%, ×1.25 → 96.5% / 92.5%.
+
+**Caveat:** the vocal head was trained on takes 1 and 2
+(`trained_on` in `peggy_o_vocal_head.json`), so their rows are
+in-sample for the vocal term; the harness flags this. Take 3 is the
+only held-out take.
+
+### Rate-model fix (Oct 2026)
+
+Live steps and reference frames are both 0.5 s, but the verse advance
+cost was centred on `2 × rate`, so the labelled 0.5×–1.75× grid really
+spanned 1.0×–3.5× and had no state slower than the reference. Fixed to
+`d − rate` with a 0.7×–1.4× grid. On take 1 the old and new models
+score within half a point of each other at every stretch from ×0.75 to
+×1.3 (the 1.0× state the old grid called "0.5×" happened to fit), with
+the new grid locked 0.6–3.4 points more often. It is a correctness fix,
+not the cause of residual drift.
+
+Original measurements (pre-harness prototype):
 
 Scored against the hand-labeled ground truth; "block" treats any verse
 of the correct verse-block as correct (takes 2/3 only have block-level
